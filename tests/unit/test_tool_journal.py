@@ -37,6 +37,21 @@ def test_journal_records_and_replays_a_read_only_tool_result():
     assert len(journal.entries) == 1
 
 
+def test_journal_deduplicates_same_read_only_result_with_new_call_id():
+    journal = ToolExecutionJournal()
+    first_call = make_call()
+    second_call = make_call(call_id="new-call")
+
+    entry = journal.record(first_call, ToolResult("call-1", "same-result"))
+    duplicate = journal.record(
+        second_call,
+        ToolResult("new-call", "same-result"),
+    )
+
+    assert duplicate is entry
+    assert len(journal.entries) == 1
+
+
 def test_journal_keeps_defensive_argument_copies():
     journal = ToolExecutionJournal()
     arguments = {"city": "Tel Aviv", "options": {"units": "C"}}
@@ -95,6 +110,54 @@ def test_journal_reuses_side_effect_result_by_idempotency_key():
         idempotency_key="payment-1",
         replay_policy=ReplayPolicy.SIDE_EFFECTING,
     )
+    assert len(journal.entries) == 1
+
+
+def test_journal_rejects_duplicate_side_effect_with_different_key_or_result():
+    journal = ToolExecutionJournal()
+    first_call = ToolCall(
+        name="charge_card",
+        arguments={"amount": 100},
+        call_id="call-1",
+    )
+    second_call = ToolCall(
+        name="charge_card",
+        arguments={"amount": 100},
+        call_id="call-2",
+    )
+
+    journal.record(
+        first_call,
+        ToolResult(
+            "call-1",
+            "charged",
+            idempotency_key="payment-1",
+            replay_policy=ReplayPolicy.SIDE_EFFECTING,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="conflicts with an existing result"):
+        journal.record(
+            second_call,
+            ToolResult(
+                "call-2",
+                "charged twice",
+                idempotency_key="payment-1",
+                replay_policy=ReplayPolicy.SIDE_EFFECTING,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="different idempotency key"):
+        journal.record(
+            second_call,
+            ToolResult(
+                "call-2",
+                "charged",
+                idempotency_key="payment-2",
+                replay_policy=ReplayPolicy.SIDE_EFFECTING,
+            ),
+        )
+
     assert len(journal.entries) == 1
 
 
