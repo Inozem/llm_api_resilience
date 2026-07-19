@@ -5,6 +5,8 @@ import pytest
 from llm_api_adapter.models.responses.chat_response import ChatResponse
 from llm_api_resilience import AdapterProtocol, AttemptRecord
 
+pytestmark = pytest.mark.unit
+
 
 class SuccessfulFakeAdapter:
     def chat(self, **kwargs) -> ChatResponse:

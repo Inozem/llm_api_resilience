@@ -1,3 +1,5 @@
+import pytest
+
 from llm_api_adapter.llms.openai import sync_client as openai_sync_client
 from llm_api_adapter.models.responses.chat_response import ChatResponse
 from llm_api_adapter.universal_adapter import UniversalLLMAPIAdapter
@@ -9,6 +11,8 @@ from llm_api_resilience import (
     Route,
     RoutePolicy,
 )
+
+pytestmark = pytest.mark.integration
 
 
 class FakeHTTPResponse:

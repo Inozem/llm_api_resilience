@@ -2,6 +2,8 @@ import pytest
 
 from llm_api_resilience import RecoveryPlan, Route, RoutePolicy
 
+pytestmark = pytest.mark.unit
+
 
 class FakeAdapter:
     def chat(self, **kwargs):

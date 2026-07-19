@@ -1,3 +1,5 @@
+import pytest
+
 from llm_api_resilience import (
     AdapterProtocol,
     AttemptRecord,
@@ -10,6 +12,8 @@ from llm_api_resilience import (
     Route,
     RoutePolicy,
 )
+
+pytestmark = pytest.mark.unit
 
 
 def test_v01_public_exports_are_available():

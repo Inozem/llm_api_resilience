@@ -1,7 +1,11 @@
+import pytest
+
 from llm_api_adapter.models.responses.chat_response import ChatResponse, Usage
 from llm_api_adapter.models.tools import ToolCall
 
 from llm_api_resilience import AttemptRecord, ResilientChatResponse
+
+pytestmark = pytest.mark.unit
 
 
 def make_base_response() -> ChatResponse:

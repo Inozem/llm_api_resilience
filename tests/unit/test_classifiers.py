@@ -22,6 +22,8 @@ from llm_api_resilience import (
     Route,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class FakeAdapter:
     def chat(self, **kwargs):

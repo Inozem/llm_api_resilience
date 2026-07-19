@@ -21,6 +21,8 @@ from llm_api_resilience import (
     RoutePolicy,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class FakeAdapter:
     def __init__(self, *, provider="fake", model="fake-model", response=None, error=None):
