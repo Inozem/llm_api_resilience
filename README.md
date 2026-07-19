@@ -123,6 +123,20 @@ result-based fallback, automatic tool execution, tool checkpoints, or
 cross-provider tool replay. Tool-call responses are returned as ordinary
 responses without automatic execution or replay.
 
+## E2E tests
+
+The opt-in E2E test calls each provider through `ResilientLLM` and uses the
+current model from `llm-api-adapter`'s model registry. Copy `.env.example` to
+`.env`, add the provider keys, and run:
+
+```bash
+python -m pip install -e ".[test]"
+pytest -m e2e
+```
+
+Cases without a configured key are skipped. The local `.env` file is ignored
+by Git and must not contain committed credentials.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
