@@ -9,6 +9,7 @@ from .responses import ResilientChatResponse
 from .resilient_llm import ResilientLLM
 from .routes import RecoveryPlan, Route
 from .session import ResilientSession, ToolResult
+from .tool_journal import ReplayPolicy, ToolExecutionJournal, ToolExecutionRecord
 
 __version__ = "0.1.0"
 
@@ -26,7 +27,10 @@ __all__ = [
     "ResilientSession",
     "ResilientChatResponse",
     "ResilientLLM",
+    "ReplayPolicy",
     "SessionStateError",
+    "ToolExecutionJournal",
+    "ToolExecutionRecord",
     "ToolResult",
     "__version__",
 ]

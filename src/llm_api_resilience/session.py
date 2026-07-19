@@ -25,6 +25,7 @@ class ToolResult:
 
     tool_call_id: str
     content: str
+    idempotency_key: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_call_id, str):
@@ -33,6 +34,11 @@ class ToolResult:
             raise ValueError("tool_call_id must not be empty")
         if not isinstance(self.content, str):
             raise TypeError("content must be a string")
+        if self.idempotency_key is not None:
+            if not isinstance(self.idempotency_key, str):
+                raise TypeError("idempotency_key must be a string or None")
+            if not self.idempotency_key.strip():
+                raise ValueError("idempotency_key must not be empty")
 
 
 class ResilientSession:
