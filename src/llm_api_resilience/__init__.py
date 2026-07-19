@@ -2,6 +2,7 @@
 
 from .attempts import AdapterProtocol, AttemptRecord
 from .policies import RoutePolicy
+from .responses import ResilientChatResponse
 from .routes import RecoveryPlan, Route
 
 __version__ = "0.1.0"
@@ -12,5 +13,6 @@ __all__ = [
     "RecoveryPlan",
     "Route",
     "RoutePolicy",
+    "ResilientChatResponse",
     "__version__",
 ]
