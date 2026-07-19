@@ -10,6 +10,7 @@ from llm_api_adapter.models.responses.chat_response import ChatResponse
 
 from llm_api_resilience import (
     RecoveryPlan,
+    FailoverExhaustedError,
     ResilientChatResponse,
     ResilientLLM,
     Route,
@@ -196,6 +197,46 @@ def test_resilient_llm_fails_over_after_route_attempts_are_exhausted():
     assert response.attempts[-1].success is True
     assert len(primary.calls) == 2
     assert len(backup.calls) == 1
+
+
+def test_resilient_llm_raises_aggregate_error_after_all_routes_fail():
+    last_error = LLMAPIServerError(
+        detail="api_key=secret request_body={'prompt': 'private'}"
+    )
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError()],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = SequenceFakeAdapter(
+        [last_error],
+        provider="anthropic",
+        model="backup-model",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary), Route("backup", backup)])
+    )
+
+    with pytest.raises(FailoverExhaustedError) as raised:
+        llm.chat([])
+
+    error = raised.value
+    assert error.last_error is last_error
+    assert error.last_exception is last_error
+    assert error.__cause__ is last_error
+    assert isinstance(error.attempts, tuple)
+    assert len(error.attempts) == 2
+    assert [attempt.route_name for attempt in error.attempts] == [
+        "primary",
+        "backup",
+    ]
+    assert "primary" in str(error)
+    assert "openai/primary-model" in str(error)
+    assert "anthropic/backup-model" in str(error)
+    assert "LLMAPITimeoutError" in str(error)
+    assert "LLMAPIServerError" in str(error)
+    assert "secret" not in str(error)
+    assert "request_body" not in str(error)
 
 
 def test_resilient_llm_does_not_fail_over_non_retryable_errors():

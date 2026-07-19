@@ -2,6 +2,7 @@
 
 from .attempts import AdapterProtocol, AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
+from .errors import FailoverExhaustedError
 from .policies import RoutePolicy
 from .responses import ResilientChatResponse
 from .resilient_llm import ResilientLLM
@@ -13,6 +14,7 @@ __all__ = [
     "AdapterProtocol",
     "AttemptRecord",
     "DefaultFailureClassifier",
+    "FailoverExhaustedError",
     "FailureClassifier",
     "RecoveryPlan",
     "Route",

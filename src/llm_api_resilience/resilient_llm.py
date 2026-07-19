@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
+from .errors import FailoverExhaustedError
 from .responses import ResilientChatResponse
 from .routes import RecoveryPlan, Route
 
@@ -109,7 +110,7 @@ class ResilientLLM:
                 )
 
         if last_error is not None:
-            raise last_error
+            raise FailoverExhaustedError(attempts, last_error) from last_error
         raise RuntimeError("recovery plan did not execute any route")
 
     @staticmethod
