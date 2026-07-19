@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
+from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .responses import ResilientChatResponse
 from .routes import RecoveryPlan, Route
 
@@ -16,10 +17,21 @@ class ResilientLLM:
     route loop and retry behavior are introduced in v0.2.
     """
 
-    def __init__(self, recovery_plan: RecoveryPlan):
+    def __init__(
+        self,
+        recovery_plan: RecoveryPlan,
+        failure_classifier: Optional[FailureClassifier] = None,
+    ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
+        if failure_classifier is None:
+            failure_classifier = DefaultFailureClassifier()
+        if not isinstance(failure_classifier, FailureClassifier):
+            raise TypeError(
+                "failure_classifier must provide an is_retryable method"
+            )
         self._recovery_plan = recovery_plan
+        self._failure_classifier = failure_classifier
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
 
     @property
@@ -33,6 +45,12 @@ class ResilientLLM:
         """Metadata for the most recent call, including failed calls."""
 
         return self._last_attempts
+
+    @property
+    def failure_classifier(self) -> FailureClassifier:
+        """Classifier used by future retry and failover execution."""
+
+        return self._failure_classifier
 
     def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
         """Delegate one chat request to the first route in the plan."""
