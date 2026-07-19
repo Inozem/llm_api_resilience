@@ -2,6 +2,8 @@ import pytest
 
 from llm_api_resilience import RecoveryPlan, Route, RoutePolicy
 
+pytestmark = pytest.mark.unit
+
 
 class FakeAdapter:
     def chat(self, **kwargs):
@@ -51,7 +53,49 @@ def test_recovery_plan_preserves_order_and_is_immutable():
     assert len(plan) == 2
 
 
-def test_route_policy_rejects_retry_in_v01():
-    with pytest.raises(ValueError, match="exactly one attempt"):
-        RoutePolicy(max_attempts=2)
+def test_route_policy_accepts_multiple_attempts():
+    policy = RoutePolicy(max_attempts=3)
+
+    assert policy.max_attempts == 3
+    assert policy.backoff_s == 0.0
+    assert policy.backoff_multiplier == 2.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"max_attempts": 0}, "at least 1"),
+        ({"max_attempts": -1}, "at least 1"),
+        ({"max_attempts": True}, "integer"),
+        ({"backoff_s": -0.1}, "non-negative"),
+        ({"backoff_s": True}, "non-negative number"),
+        ({"backoff_multiplier": -1.0}, "non-negative"),
+        ({"backoff_multiplier": "2"}, "non-negative number"),
+    ],
+)
+def test_route_policy_rejects_invalid_retry_values(kwargs, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        RoutePolicy(**kwargs)
+
+
+def test_route_policy_calculates_exponential_backoff_in_order():
+    policy = RoutePolicy(
+        max_attempts=4,
+        backoff_s=0.5,
+        backoff_multiplier=2.0,
+    )
+
+    assert policy.backoff_for(1) == pytest.approx(0.5)
+    assert policy.backoff_for(2) == pytest.approx(1.0)
+    assert policy.backoff_for(3) == pytest.approx(2.0)
+    assert policy.backoff_for(4) == 0.0
+
+
+def test_route_policy_rejects_invalid_failed_attempt_number():
+    policy = RoutePolicy(max_attempts=2)
+
+    with pytest.raises(ValueError, match="at least 1"):
+        policy.backoff_for(0)
+    with pytest.raises(TypeError, match="must be an integer"):
+        policy.backoff_for(1.5)
 

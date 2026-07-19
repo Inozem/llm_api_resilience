@@ -1,25 +1,34 @@
 """Public resilient LLM facade."""
 
 from datetime import datetime, timezone
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
+from .classifiers import DefaultFailureClassifier, FailureClassifier
+from .errors import FailoverExhaustedError
 from .responses import ResilientChatResponse
 from .routes import RecoveryPlan, Route
 
 
 class ResilientLLM:
-    """Execute chat requests through the first route in a recovery plan.
+    """Execute chat requests with retry and ordered route failover."""
 
-    Version 0.1 is intentionally a transparent single-route facade.  The
-    route loop and retry behavior are introduced in v0.2.
-    """
-
-    def __init__(self, recovery_plan: RecoveryPlan):
+    def __init__(
+        self,
+        recovery_plan: RecoveryPlan,
+        failure_classifier: Optional[FailureClassifier] = None,
+    ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
+        if failure_classifier is None:
+            failure_classifier = DefaultFailureClassifier()
+        if not isinstance(failure_classifier, FailureClassifier):
+            raise TypeError(
+                "failure_classifier must provide an is_retryable method"
+            )
         self._recovery_plan = recovery_plan
+        self._failure_classifier = failure_classifier
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
 
     @property
@@ -34,45 +43,91 @@ class ResilientLLM:
 
         return self._last_attempts
 
-    def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
-        """Delegate one chat request to the first route in the plan."""
+    @property
+    def failure_classifier(self) -> FailureClassifier:
+        """Classifier used for retry and failover decisions."""
 
-        route = self._recovery_plan[0]
-        request_kwargs: Dict[str, Any] = dict(kwargs)
+        return self._failure_classifier
+
+    def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
+        """Retry transient failures and fail over through the route order."""
+
+        attempts = []
+        last_error: Optional[Exception] = None
+
+        for route_index, route in enumerate(self._recovery_plan):
+            for failed_attempt in range(1, route.policy.max_attempts + 1):
+                request_kwargs = self._build_request_kwargs(
+                    kwargs,
+                    route=route,
+                    include_previous_response=route_index == 0,
+                )
+                started_at = datetime.now(timezone.utc)
+                started_tick = perf_counter()
+
+                try:
+                    response = route.adapter.chat(
+                        messages=messages,
+                        **request_kwargs,
+                    )
+                except Exception as error:
+                    duration_s = perf_counter() - started_tick
+                    attempt = self._make_attempt_record(
+                        route=route,
+                        started_at=started_at,
+                        duration_s=duration_s,
+                        success=False,
+                        error=error,
+                    )
+                    attempts.append(attempt)
+                    self._last_attempts = tuple(attempts)
+                    last_error = error
+
+                    if not self._failure_classifier.is_retryable(error):
+                        raise
+
+                    if failed_attempt >= route.policy.max_attempts:
+                        break
+
+                    delay_s = route.policy.backoff_for(failed_attempt)
+                    if delay_s > 0:
+                        sleep(delay_s)
+                    continue
+
+                duration_s = perf_counter() - started_tick
+                attempt = self._make_attempt_record(
+                    route=route,
+                    started_at=started_at,
+                    duration_s=duration_s,
+                    success=True,
+                )
+                attempts.append(attempt)
+                self._last_attempts = tuple(attempts)
+                return ResilientChatResponse.from_chat_response(
+                    response,
+                    selected_route=route.name,
+                    attempts=tuple(attempts),
+                )
+
+        if last_error is not None:
+            raise FailoverExhaustedError(attempts, last_error) from last_error
+        raise RuntimeError("recovery plan did not execute any route")
+
+    @staticmethod
+    def _build_request_kwargs(
+        original_kwargs: Dict[str, Any],
+        *,
+        route: Route,
+        include_previous_response: bool,
+    ) -> Dict[str, Any]:
+        """Build isolated kwargs for one attempt without mutating the caller."""
+
+        request_kwargs = dict(original_kwargs)
+        if not include_previous_response:
+            request_kwargs.pop("previous_response", None)
         if "timeout_s" not in request_kwargs and route.policy.timeout_s is not None:
             request_kwargs["timeout_s"] = route.policy.timeout_s
-
-        started_at = datetime.now(timezone.utc)
-        started_tick = perf_counter()
-
-        try:
-            response = route.adapter.chat(messages=messages, **request_kwargs)
-            duration_s = perf_counter() - started_tick
-            attempt = self._make_attempt_record(
-                route=route,
-                started_at=started_at,
-                duration_s=duration_s,
-                success=True,
-            )
-            resilient_response = ResilientChatResponse.from_chat_response(
-                response,
-                selected_route=route.name,
-                attempts=(attempt,),
-            )
-        except Exception as error:
-            duration_s = perf_counter() - started_tick
-            attempt = self._make_attempt_record(
-                route=route,
-                started_at=started_at,
-                duration_s=duration_s,
-                success=False,
-                error=error,
-            )
-            self._last_attempts = (attempt,)
-            raise
-
-        self._last_attempts = (attempt,)
-        return resilient_response
+        return request_kwargs
 
     def _make_attempt_record(
         self,
