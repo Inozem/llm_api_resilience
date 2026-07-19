@@ -1,0 +1,152 @@
+import pytest
+
+from llm_api_adapter.errors import LLMAPITimeoutError
+from llm_api_adapter.models.responses.chat_response import ChatResponse
+from llm_api_adapter.models.tools import ToolCall
+from llm_api_adapter.models.messages.chat_message import AIMessage, ToolMessage
+
+from llm_api_resilience import (
+    RecoveryPlan,
+    ResilientChatResponse,
+    ResilientLLM,
+    Route,
+    SessionStateError,
+    ToolResult,
+)
+
+
+pytestmark = pytest.mark.unit
+
+
+class SequenceAdapter:
+    organization = "openai"
+    model = "gpt-test"
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def tool_call_response():
+    return ChatResponse(
+        model="gpt-test",
+        tool_calls=[
+            ToolCall(
+                name="lookup_user",
+                arguments={"user_id": "42"},
+                call_id="call-1",
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+
+
+def make_llm(adapter):
+    return ResilientLLM(RecoveryPlan([Route("primary", adapter)]))
+
+
+def test_session_returns_tool_call_and_continues_with_application_result():
+    adapter = SequenceAdapter(
+        [tool_call_response(), ChatResponse(content="User is active", model="gpt-test")]
+    )
+    llm = make_llm(adapter)
+    original_messages = [{"role": "user", "content": "Find user 42"}]
+    session = llm.session(
+        original_messages,
+        tools=["lookup_user"],
+        max_tokens=128,
+    )
+
+    first = session.start()
+    final = session.continue_with(
+        [ToolResult("call-1", '{"user_id":"42","active":true}')]
+    )
+
+    assert isinstance(first, ResilientChatResponse)
+    assert first.tool_calls is not None
+    assert final.content == "User is active"
+    assert final.selected_route == "primary"
+    assert session.is_closed is True
+    assert session.checkpoint is not None
+    assert session.checkpoint.route.provider_model == ("openai", "gpt-test")
+    assert len(session.attempts) == 2
+    assert original_messages == [{"role": "user", "content": "Find user 42"}]
+
+    continuation_messages = adapter.calls[1]["messages"]
+    assert isinstance(continuation_messages[1], AIMessage)
+    assert isinstance(continuation_messages[2], ToolMessage)
+    assert continuation_messages[2].tool_call_id == "call-1"
+    assert "previous_response" not in adapter.calls[1]
+
+
+def test_session_can_accept_a_single_tool_result_object():
+    adapter = SequenceAdapter(
+        [tool_call_response(), ChatResponse(content="done", model="gpt-test")]
+    )
+    session = make_llm(adapter).session([])
+
+    session.start()
+    response = session.continue_with(ToolResult("call-1", "ok"))
+
+    assert response.content == "done"
+
+
+def test_session_without_tool_calls_is_closed_and_cannot_continue():
+    adapter = SequenceAdapter([ChatResponse(content="final", model="gpt-test")])
+    session = make_llm(adapter).session([])
+
+    response = session.start()
+
+    assert response.content == "final"
+    assert session.checkpoint is None
+    assert session.is_closed is True
+    with pytest.raises(SessionStateError, match="final response"):
+        session.continue_with([])
+
+
+def test_session_requires_start_before_continuation():
+    session = make_llm(SequenceAdapter([tool_call_response()])).session([])
+
+    with pytest.raises(SessionStateError, match=r"start\(\)"):
+        session.continue_with([])
+
+
+@pytest.mark.parametrize(
+    "tool_results",
+    [
+        [],
+        [ToolResult("unknown", "ok")],
+        [ToolResult("call-1", "first"), ToolResult("call-1", "duplicate")],
+    ],
+)
+def test_session_rejects_tool_results_that_do_not_match_current_calls(tool_results):
+    adapter = SequenceAdapter([tool_call_response()])
+    session = make_llm(adapter).session([])
+    session.start()
+
+    with pytest.raises(ValueError):
+        session.continue_with(tool_results)
+
+    assert len(adapter.calls) == 1
+
+
+def test_session_records_continuation_failure_and_reraises_original_error():
+    error = LLMAPITimeoutError(detail="temporary")
+    adapter = SequenceAdapter([tool_call_response(), error])
+    llm = make_llm(adapter)
+    session = llm.session([])
+    session.start()
+
+    with pytest.raises(LLMAPITimeoutError) as raised:
+        session.continue_with(ToolResult("call-1", "ok"))
+
+    assert raised.value is error
+    assert [attempt.success for attempt in session.attempts] == [True, False]
+    assert llm.last_attempts == session.attempts

@@ -49,6 +49,13 @@ class ResilientLLM:
 
         return self._failure_classifier
 
+    def session(self, messages: Any, **kwargs: Any):
+        """Create an application-managed session for tool-calling recovery."""
+
+        from .session import ResilientSession
+
+        return ResilientSession(self, messages, kwargs)
+
     def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
         """Retry transient failures and fail over through the route order."""
 
