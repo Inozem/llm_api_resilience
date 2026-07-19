@@ -93,6 +93,7 @@ def test_journal_reuses_side_effect_result_by_idempotency_key():
         "call-2",
         "charged",
         idempotency_key="payment-1",
+        replay_policy=ReplayPolicy.SIDE_EFFECTING,
     )
     assert len(journal.entries) == 1
 

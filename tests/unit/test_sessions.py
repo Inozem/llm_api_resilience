@@ -22,7 +22,11 @@ class SequenceAdapter:
     organization = "openai"
     model = "gpt-test"
 
-    def __init__(self, outcomes):
+    def __init__(self, outcomes, *, provider=None, model=None):
+        if provider is not None:
+            self.organization = provider
+        if model is not None:
+            self.model = model
         self.outcomes = list(outcomes)
         self.calls = []
 
@@ -34,14 +38,14 @@ class SequenceAdapter:
         return outcome
 
 
-def tool_call_response():
+def tool_call_response(*, call_id="call-1", model="gpt-test"):
     return ChatResponse(
-        model="gpt-test",
+        model=model,
         tool_calls=[
             ToolCall(
                 name="lookup_user",
                 arguments={"user_id": "42"},
-                call_id="call-1",
+                call_id=call_id,
             )
         ],
         finish_reason="tool_calls",
@@ -197,3 +201,49 @@ def test_session_updates_previous_response_for_each_same_route_tool_round():
 
     assert adapter.calls[1]["previous_response"] is first_response
     assert adapter.calls[2]["previous_response"] is second_response
+
+
+def test_session_replays_checkpoint_tool_result_on_next_route():
+    timeout = LLMAPITimeoutError(detail="primary continuation failed")
+    primary = SequenceAdapter([tool_call_response(), timeout])
+    backup_first = tool_call_response(call_id="call-2", model="backup-test")
+    backup = SequenceAdapter(
+        [backup_first, ChatResponse(content="recovered", model="backup-test")],
+        provider="anthropic",
+        model="backup-test",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary),
+                Route("backup", backup),
+            ]
+        )
+    )
+    session = llm.session([{"role": "user", "content": "Find user 42"}])
+
+    first = session.start()
+    result = ToolResult(
+        "call-1",
+        "user is active",
+        idempotency_key="lookup-user-42",
+        replay_policy="side_effecting",
+    )
+    final = session.continue_with(result)
+
+    assert final.content == "recovered"
+    assert final.selected_route == "backup"
+    assert [attempt.route_name for attempt in session.attempts] == [
+        "primary",
+        "primary",
+        "backup",
+        "backup",
+    ]
+    assert primary.calls[1]["previous_response"] is first
+    assert "previous_response" not in backup.calls[0]
+    assert backup.calls[1]["previous_response"] is not None
+    assert backup.calls[1]["previous_response"].selected_route == "backup"
+    assert len(session.journal.entries) == 1
+    assert session.checkpoint.messages == (
+        {"role": "user", "content": "Find user 42"},
+    )

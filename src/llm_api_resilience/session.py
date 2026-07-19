@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 from llm_api_adapter.models.messages.chat_message import AIMessage, ToolMessage
@@ -11,7 +11,7 @@ from llm_api_adapter.models.responses.chat_response import ChatResponse
 
 from .attempts import AttemptRecord
 from .checkpoints import Checkpoint, RouteIdentity
-from .errors import SessionStateError
+from .errors import FailoverExhaustedError, SessionStateError
 from .responses import ResilientChatResponse
 from .routes import Route
 
@@ -26,6 +26,7 @@ class ToolResult:
     tool_call_id: str
     content: str
     idempotency_key: Optional[str] = None
+    replay_policy: str = "replayable"
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_call_id, str):
@@ -40,13 +41,20 @@ class ToolResult:
             if not self.idempotency_key.strip():
                 raise ValueError("idempotency_key must not be empty")
 
+        policy = getattr(self.replay_policy, "value", self.replay_policy)
+        if policy not in ("replayable", "side_effecting"):
+            raise ValueError(
+                "replay_policy must be 'replayable' or 'side_effecting'"
+            )
+        object.__setattr__(self, "replay_policy", policy)
+
 
 class ResilientSession:
     """Manage an application-driven tool loop on the selected route.
 
-    This initial session implementation supports a first tool call and
-    same-route continuation. Retry, journal-backed replay, and cross-route
-    recovery are added in later versions.
+    The session captures a provider-neutral checkpoint before tool execution,
+    then uses the journal to replay completed tools when a later route is
+    required.
     """
 
     def __init__(
@@ -54,6 +62,7 @@ class ResilientSession:
         llm: "ResilientLLM",
         messages: Iterable[Any],
         request_kwargs: dict,
+        journal: Any = None,
     ) -> None:
         if not hasattr(llm, "chat") or not hasattr(llm, "recovery_plan"):
             raise TypeError("llm must be a ResilientLLM")
@@ -72,10 +81,22 @@ class ResilientSession:
         self._attempts: List[AttemptRecord] = []
         self._checkpoint: Optional[Checkpoint] = None
         self._active_route: Optional[Route] = None
+        self._active_route_index: Optional[int] = None
         self._response: Optional[ResilientChatResponse] = None
+        self._response_route_identity: Optional[RouteIdentity] = None
         self._pending_tool_results: Optional[Tuple[ToolResult, ...]] = None
         self._started = False
         self._closed = False
+
+        if journal is None:
+            from .tool_journal import ToolExecutionJournal
+
+            journal = ToolExecutionJournal()
+        if not callable(getattr(journal, "record", None)) or not callable(
+            getattr(journal, "replay_result", None)
+        ):
+            raise TypeError("journal must provide record and replay_result methods")
+        self._journal = journal
 
     @property
     def checkpoint(self) -> Optional[Checkpoint]:
@@ -101,6 +122,12 @@ class ResilientSession:
 
         return self._closed
 
+    @property
+    def journal(self) -> Any:
+        """Journal used to reuse completed tool results during replay."""
+
+        return self._journal
+
     def start(self) -> ResilientChatResponse:
         """Execute the first route call and capture a tool checkpoint if needed."""
 
@@ -115,6 +142,7 @@ class ResilientSession:
         self._response = response
         self._attempts = list(response.attempts)
         self._active_route = self._route_for_response(response)
+        self._response_route_identity = self._route_identity(self._active_route)
         self._llm._last_attempts = tuple(self._attempts)
 
         if response.tool_calls:
@@ -145,6 +173,7 @@ class ResilientSession:
         normalized_results = self._normalize_tool_results(tool_results)
         self._validate_tool_results(normalized_results)
         if self._pending_tool_results is None:
+            self._record_tool_results(normalized_results)
             self._append_tool_round(normalized_results)
             self._pending_tool_results = normalized_results
         elif normalized_results != self._pending_tool_results:
@@ -152,28 +181,64 @@ class ResilientSession:
                 "retrying a continuation must use the same tool results"
             )
 
-        request_kwargs = self._llm._build_request_kwargs(
-            self._request_kwargs,
-            route=self._active_route,
+        try:
+            response = self._invoke_route(
+                self._active_route,
+                messages=self._working_messages,
+                request_kwargs=self._request_kwargs,
+                include_previous_response=True,
+            )
+        except Exception as error:
+            if self._llm.failure_classifier.is_retryable(error) and self._has_next_route:
+                return self._replay_from_checkpoint(error)
+            raise
+
+        self._pending_tool_results = None
+        if not self._response.tool_calls:
+            self._closed = True
+        return self._response
+
+    @property
+    def _has_next_route(self) -> bool:
+        return (
+            self._active_route_index is not None
+            and self._active_route_index + 1 < len(self._llm.recovery_plan)
+        )
+
+    def _invoke_route(
+        self,
+        route: Route,
+        *,
+        messages: Iterable[Any],
+        request_kwargs: dict,
+        include_previous_response: bool,
+    ) -> ResilientChatResponse:
+        """Call one route and append safe attempt metadata."""
+
+        normalized_kwargs = self._llm._build_request_kwargs(
+            request_kwargs,
+            route=route,
             include_previous_response=False,
         )
-        current_route = self._route_identity(self._active_route)
+        route_identity = self._route_identity(route)
         if (
-            self._checkpoint is not None
-            and self._checkpoint.route.is_compatible_with(current_route)
+            include_previous_response
+            and self._response is not None
+            and self._response_route_identity is not None
+            and self._response_route_identity.is_compatible_with(route_identity)
         ):
-            request_kwargs["previous_response"] = self._response
+            normalized_kwargs["previous_response"] = self._response
+
         started_at = datetime.now(timezone.utc)
         started_tick = perf_counter()
-
         try:
-            response = self._active_route.adapter.chat(
-                messages=self._working_messages,
-                **request_kwargs,
+            response = route.adapter.chat(
+                messages=messages,
+                **normalized_kwargs,
             )
         except Exception as error:
             attempt = self._llm._make_attempt_record(
-                route=self._active_route,
+                route=route,
                 started_at=started_at,
                 duration_s=perf_counter() - started_tick,
                 success=False,
@@ -184,22 +249,78 @@ class ResilientSession:
             raise
 
         attempt = self._llm._make_attempt_record(
-            route=self._active_route,
+            route=route,
             started_at=started_at,
             duration_s=perf_counter() - started_tick,
             success=True,
         )
         self._attempts.append(attempt)
         self._llm._last_attempts = tuple(self._attempts)
+        self._active_route = route
+        self._response_route_identity = route_identity
         self._response = ResilientChatResponse.from_chat_response(
             response,
-            selected_route=self._active_route.name,
+            selected_route=route.name,
             attempts=tuple(self._attempts),
         )
-        self._pending_tool_results = None
-        if not response.tool_calls:
-            self._closed = True
         return self._response
+
+    def _replay_from_checkpoint(
+        self,
+        last_error: Exception,
+    ) -> ResilientChatResponse:
+        """Recover a failed continuation from the next compatible request route."""
+
+        if self._checkpoint is None:
+            raise SessionStateError("tool continuation has no checkpoint")
+        if self._active_route_index is None:
+            raise SessionStateError("session has no active route index")
+
+        self._working_messages = list(deepcopy(self._checkpoint.messages))
+        self._pending_tool_results = None
+        self._response = None
+        self._response_route_identity = None
+        last_route_error = last_error
+
+        for route_index in range(
+            self._active_route_index + 1,
+            len(self._llm.recovery_plan),
+        ):
+            route = self._llm.recovery_plan[route_index]
+            self._active_route = route
+            self._active_route_index = route_index
+
+            for failed_attempt in range(1, route.policy.max_attempts + 1):
+                try:
+                    response = self._invoke_route(
+                        route,
+                        messages=self._working_messages,
+                        request_kwargs=self._checkpoint.request_kwargs,
+                        include_previous_response=False,
+                    )
+                except Exception as error:
+                    last_route_error = error
+                    if not self._llm.failure_classifier.is_retryable(error):
+                        raise
+                    if failed_attempt >= route.policy.max_attempts:
+                        break
+                    delay_s = route.policy.backoff_for(failed_attempt)
+                    if delay_s > 0:
+                        sleep(delay_s)
+                    continue
+
+                if not response.tool_calls:
+                    self._closed = True
+                    return response
+
+                replayed_results = self._journal_results_for(response.tool_calls)
+                if replayed_results is None:
+                    return response
+                return self.continue_with(replayed_results)
+
+        if len(self._llm.recovery_plan) == 1:
+            raise last_error
+        raise FailoverExhaustedError(self._attempts, last_route_error) from last_route_error
 
     def _ensure_started(self) -> None:
         if not self._started:
@@ -207,8 +328,9 @@ class ResilientSession:
 
     def _route_for_response(self, response: ChatResponse) -> Route:
         selected_route = response.selected_route
-        for route in self._llm.recovery_plan:
+        for route_index, route in enumerate(self._llm.recovery_plan):
             if route.name == selected_route:
+                self._active_route_index = route_index
                 return route
         raise SessionStateError("response selected an unknown route")
 
@@ -265,3 +387,30 @@ class ResilientSession:
             )
             for result in tool_results
         )
+
+    def _record_tool_results(self, tool_results: Tuple[ToolResult, ...]) -> None:
+        from .tool_journal import ReplayPolicy
+
+        calls_by_id = {
+            call.call_id or call.name: call for call in self._response.tool_calls
+        }
+        for result in tool_results:
+            call = calls_by_id[result.tool_call_id]
+            self._journal.record(
+                call,
+                result,
+                replay_policy=ReplayPolicy(result.replay_policy),
+                idempotency_key=result.idempotency_key,
+            )
+
+    def _journal_results_for(
+        self,
+        tool_calls: Iterable[Any],
+    ) -> Optional[Tuple[ToolResult, ...]]:
+        results = []
+        for call in tool_calls:
+            result = self._journal.replay_result(call)
+            if result is None:
+                return None
+            results.append(result)
+        return tuple(results)

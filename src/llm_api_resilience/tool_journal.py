@@ -89,7 +89,7 @@ class ToolExecutionJournal:
         tool_call: ToolCall,
         result: ToolResult,
         *,
-        replay_policy: ReplayPolicy = ReplayPolicy.REPLAYABLE,
+        replay_policy: Optional[ReplayPolicy] = None,
         status: str = "completed",
         idempotency_key: Optional[str] = None,
     ) -> ToolExecutionRecord:
@@ -98,9 +98,17 @@ class ToolExecutionJournal:
         self._validate_tool_call(tool_call)
         if not isinstance(result, ToolResult):
             raise TypeError("result must be a ToolResult")
+        if replay_policy is None:
+            replay_policy = ReplayPolicy(result.replay_policy)
         if not isinstance(replay_policy, ReplayPolicy):
             raise TypeError("replay_policy must be a ReplayPolicy")
 
+        if (
+            idempotency_key is not None
+            and result.idempotency_key is not None
+            and idempotency_key != result.idempotency_key
+        ):
+            raise ValueError("idempotency_key conflicts with the result")
         effective_key = idempotency_key or result.idempotency_key
         if replay_policy is ReplayPolicy.SIDE_EFFECTING and not effective_key:
             raise ValueError(
@@ -108,14 +116,41 @@ class ToolExecutionJournal:
             )
 
         fingerprint = self._fingerprint(tool_call)
-        existing = None
-        if effective_key:
-            existing = self._by_idempotency_key.get(effective_key)
-        elif replay_policy is ReplayPolicy.REPLAYABLE:
-            existing = self._by_fingerprint.get(fingerprint)
+        existing_by_key = (
+            self._by_idempotency_key.get(effective_key)
+            if effective_key
+            else None
+        )
+        existing_by_fingerprint = self._by_fingerprint.get(fingerprint)
+        if (
+            existing_by_key is not None
+            and existing_by_fingerprint is not None
+            and existing_by_key is not existing_by_fingerprint
+        ):
+            raise ValueError("tool invocation conflicts with existing records")
+        existing = existing_by_key or existing_by_fingerprint
+        if (
+            existing_by_key is None
+            and existing_by_fingerprint is not None
+            and replay_policy is ReplayPolicy.REPLAYABLE
+            and existing_by_fingerprint.tool_call_id
+            != (tool_call.call_id or tool_call.name)
+            and existing_by_fingerprint.result.content != result.content
+        ):
+            # Read-only calls may legitimately repeat with a new call id in a
+            # later tool round.  Keep the newest fingerprint entry available
+            # for a future cross-route replay.
+            existing = None
 
         if existing is not None:
             self._ensure_same_invocation(existing, tool_call, effective_key)
+            if (
+                existing.idempotency_key != effective_key
+                and (existing.idempotency_key or effective_key)
+            ):
+                raise ValueError("tool invocation has a different idempotency key")
+            if existing.replay_policy is not replay_policy:
+                raise ValueError("tool execution record has a different replay policy")
             if (
                 existing.status != status
                 or existing.result.content != result.content
@@ -135,8 +170,7 @@ class ToolExecutionJournal:
         self._entries.append(entry)
         if effective_key:
             self._by_idempotency_key[effective_key] = entry
-        if replay_policy is ReplayPolicy.REPLAYABLE:
-            self._by_fingerprint[fingerprint] = entry
+        self._by_fingerprint[fingerprint] = entry
         return entry
 
     def lookup(
@@ -176,6 +210,7 @@ class ToolExecutionJournal:
             tool_call_id=tool_call.call_id or tool_call.name,
             content=entry.result.content,
             idempotency_key=entry.idempotency_key,
+            replay_policy=entry.replay_policy.value,
         )
 
     @staticmethod
