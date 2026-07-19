@@ -1,5 +1,11 @@
 import pytest
 
+from llm_api_adapter.errors import (
+    LLMAPIAuthorizationError,
+    LLMAPIRateLimitError,
+    LLMAPIServerError,
+    LLMAPITimeoutError,
+)
 from llm_api_adapter.models.responses.chat_response import ChatResponse
 
 from llm_api_resilience import (
@@ -24,6 +30,21 @@ class FakeAdapter:
         if self.error is not None:
             raise self.error
         return self.response
+
+
+class SequenceFakeAdapter:
+    def __init__(self, outcomes, *, provider="fake", model="fake-model"):
+        self.organization = provider
+        self.model = model
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 def make_llm(adapter, *, timeout_s=None, backup=None):
@@ -96,7 +117,7 @@ def test_resilient_llm_reraises_original_adapter_error_and_records_failure():
     assert llm.last_attempts[0].error_message == "adapter failed"
 
 
-def test_resilient_llm_does_not_call_second_route_in_v01():
+def test_resilient_llm_does_not_fail_over_builtin_non_retryable_error():
     primary = FakeAdapter(error=TimeoutError("primary failed"))
     backup = FakeAdapter()
     llm = make_llm(primary, backup=backup)
@@ -106,4 +127,161 @@ def test_resilient_llm_does_not_call_second_route_in_v01():
 
     assert len(primary.calls) == 1
     assert backup.calls == []
+
+
+def test_resilient_llm_retries_same_route_and_returns_all_attempts(monkeypatch):
+    success = ChatResponse(content="ok", model="primary-model")
+    primary = SequenceFakeAdapter(
+        [LLMAPIRateLimitError(detail="busy"), success],
+        provider="openai",
+        model="primary-model",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route(
+                    "primary",
+                    primary,
+                    RoutePolicy(max_attempts=2, backoff_s=0.25),
+                )
+            ]
+        )
+    )
+    sleeps = []
+    monkeypatch.setattr("llm_api_resilience.resilient_llm.sleep", sleeps.append)
+
+    response = llm.chat([])
+
+    assert response.selected_route == "primary"
+    assert [attempt.success for attempt in response.attempts] == [False, True]
+    assert [attempt.route_name for attempt in response.attempts] == [
+        "primary",
+        "primary",
+    ]
+    assert len(llm.last_attempts) == 2
+    assert sleeps == [0.25]
+    assert len(primary.calls) == 2
+
+
+def test_resilient_llm_fails_over_after_route_attempts_are_exhausted():
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError(), LLMAPIServerError()],
+        provider="openai",
+        model="primary-model",
+    )
+    backup_response = ChatResponse(content="backup", model="backup-model")
+    backup = SequenceFakeAdapter(
+        [backup_response],
+        provider="anthropic",
+        model="backup-model",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, RoutePolicy(max_attempts=2)),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    response = llm.chat([])
+
+    assert response.content == "backup"
+    assert response.selected_route == "backup"
+    assert [attempt.route_name for attempt in response.attempts] == [
+        "primary",
+        "primary",
+        "backup",
+    ]
+    assert response.attempts[-1].success is True
+    assert len(primary.calls) == 2
+    assert len(backup.calls) == 1
+
+
+def test_resilient_llm_does_not_fail_over_non_retryable_errors():
+    primary = SequenceFakeAdapter([LLMAPIAuthorizationError()])
+    backup = SequenceFakeAdapter([ChatResponse(content="backup", model="backup")])
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary), Route("backup", backup)])
+    )
+
+    with pytest.raises(LLMAPIAuthorizationError):
+        llm.chat([])
+
+    assert len(primary.calls) == 1
+    assert backup.calls == []
+    assert len(llm.last_attempts) == 1
+    assert llm.last_attempts[0].success is False
+
+
+def test_resilient_llm_uses_custom_classifier_for_retry_decisions():
+    class RetryValueErrorClassifier:
+        def is_retryable(self, error):
+            return isinstance(error, ValueError)
+
+    primary = SequenceFakeAdapter(
+        [ValueError("temporary"), ChatResponse(content="ok", model="primary")]
+    )
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary, RoutePolicy(max_attempts=2))]),
+        failure_classifier=RetryValueErrorClassifier(),
+    )
+
+    response = llm.chat([])
+
+    assert response.content == "ok"
+    assert len(primary.calls) == 2
+
+
+def test_resilient_llm_does_not_sleep_after_last_attempt(monkeypatch):
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError(), LLMAPITimeoutError()],
+    )
+    backup = SequenceFakeAdapter([ChatResponse(content="backup", model="backup")])
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route(
+                    "primary",
+                    primary,
+                    RoutePolicy(max_attempts=2, backoff_s=1.0),
+                ),
+                Route("backup", backup),
+            ]
+        )
+    )
+    sleeps = []
+    monkeypatch.setattr("llm_api_resilience.resilient_llm.sleep", sleeps.append)
+
+    llm.chat([])
+
+    assert sleeps == [1.0]
+
+
+def test_resilient_llm_keeps_previous_response_only_with_same_route():
+    previous_response = ChatResponse(content="previous", model="primary")
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError(), LLMAPITimeoutError()],
+        provider="openai",
+        model="primary",
+    )
+    backup = SequenceFakeAdapter(
+        [ChatResponse(content="backup", model="backup")],
+        provider="anthropic",
+        model="backup",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, RoutePolicy(max_attempts=2)),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    llm.chat([], previous_response=previous_response)
+
+    assert primary.calls[0]["previous_response"] is previous_response
+    assert primary.calls[1]["previous_response"] is previous_response
+    assert "previous_response" not in backup.calls[0]
 
