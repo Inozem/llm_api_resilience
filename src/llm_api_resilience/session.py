@@ -73,6 +73,7 @@ class ResilientSession:
         self._checkpoint: Optional[Checkpoint] = None
         self._active_route: Optional[Route] = None
         self._response: Optional[ResilientChatResponse] = None
+        self._pending_tool_results: Optional[Tuple[ToolResult, ...]] = None
         self._started = False
         self._closed = False
 
@@ -143,13 +144,25 @@ class ResilientSession:
 
         normalized_results = self._normalize_tool_results(tool_results)
         self._validate_tool_results(normalized_results)
-        self._append_tool_round(normalized_results)
+        if self._pending_tool_results is None:
+            self._append_tool_round(normalized_results)
+            self._pending_tool_results = normalized_results
+        elif normalized_results != self._pending_tool_results:
+            raise SessionStateError(
+                "retrying a continuation must use the same tool results"
+            )
 
         request_kwargs = self._llm._build_request_kwargs(
             self._request_kwargs,
             route=self._active_route,
             include_previous_response=False,
         )
+        current_route = self._route_identity(self._active_route)
+        if (
+            self._checkpoint is not None
+            and self._checkpoint.route.is_compatible_with(current_route)
+        ):
+            request_kwargs["previous_response"] = self._response
         started_at = datetime.now(timezone.utc)
         started_tick = perf_counter()
 
@@ -183,6 +196,7 @@ class ResilientSession:
             selected_route=self._active_route.name,
             attempts=tuple(self._attempts),
         )
+        self._pending_tool_results = None
         if not response.tool_calls:
             self._closed = True
         return self._response

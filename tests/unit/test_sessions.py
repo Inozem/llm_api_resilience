@@ -83,7 +83,7 @@ def test_session_returns_tool_call_and_continues_with_application_result():
     assert isinstance(continuation_messages[1], AIMessage)
     assert isinstance(continuation_messages[2], ToolMessage)
     assert continuation_messages[2].tool_call_id == "call-1"
-    assert "previous_response" not in adapter.calls[1]
+    assert adapter.calls[1]["previous_response"] is first
 
 
 def test_session_can_accept_a_single_tool_result_object():
@@ -150,3 +150,50 @@ def test_session_records_continuation_failure_and_reraises_original_error():
     assert raised.value is error
     assert [attempt.success for attempt in session.attempts] == [True, False]
     assert llm.last_attempts == session.attempts
+
+
+def test_session_retries_same_continuation_without_duplicate_messages():
+    error = LLMAPITimeoutError(detail="temporary")
+    first = tool_call_response()
+    final = ChatResponse(content="recovered", model="gpt-test")
+    adapter = SequenceAdapter([first, error, final])
+    llm = make_llm(adapter)
+    session = llm.session([])
+    first_response = session.start()
+    result = ToolResult("call-1", "ok")
+
+    with pytest.raises(LLMAPITimeoutError):
+        session.continue_with(result)
+    response = session.continue_with(result)
+
+    assert response.content == "recovered"
+    assert adapter.calls[1]["previous_response"] is first_response
+    assert adapter.calls[2]["previous_response"] is first_response
+    assert len(adapter.calls[1]["messages"]) == len(adapter.calls[2]["messages"])
+    assert [attempt.success for attempt in session.attempts] == [True, False, True]
+
+
+def test_session_updates_previous_response_for_each_same_route_tool_round():
+    first = tool_call_response()
+    second = ChatResponse(
+        model="gpt-test",
+        tool_calls=[
+            ToolCall(
+                name="lookup_user",
+                arguments={"user_id": "42"},
+                call_id="call-2",
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    adapter = SequenceAdapter(
+        [first, second, ChatResponse(content="done", model="gpt-test")]
+    )
+    session = make_llm(adapter).session([])
+
+    first_response = session.start()
+    second_response = session.continue_with(ToolResult("call-1", "first"))
+    session.continue_with(ToolResult("call-2", "second"))
+
+    assert adapter.calls[1]["previous_response"] is first_response
+    assert adapter.calls[2]["previous_response"] is second_response
