@@ -433,7 +433,7 @@ class ResilientLLM:
 
         if route.prompt_profile is None:
             return messages
-        return route.prompt_profile.apply_to_request(messages)
+        return list(route.prompt_profile.apply_to_request(messages))
 
     def _validate_route_response(self, response: Any, *, route: Route) -> None:
         """Validate one normalized adapter response when a policy is configured."""

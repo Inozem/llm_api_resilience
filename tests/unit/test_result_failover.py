@@ -119,6 +119,71 @@ def test_invalid_result_can_retry_the_same_route_before_failover():
     assert len(backup.calls) == 0
 
 
+def test_valid_result_does_not_trigger_backup():
+    primary = SequenceAdapter(
+        [ChatResponse(content="valid", model="primary-model")],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = SequenceAdapter(
+        [ChatResponse(content="unused", model="backup-model")],
+        provider="anthropic",
+        model="backup-model",
+    )
+
+    response = make_llm(primary, backup).chat([])
+
+    assert response.selected_route == "primary"
+    assert response.content == "valid"
+    assert backup.calls == []
+
+
+def test_structured_output_policy_rejects_missing_required_field():
+    def structured_policy(response):
+        payload = response.parsed_json
+        is_valid = isinstance(payload, dict) and "answer" in payload
+        return ResultDecision(
+            valid=is_valid,
+            reason_type="structured_output_missing_answer",
+        )
+
+    primary = SequenceAdapter(
+        [
+            ChatResponse(
+                content='{"detail":"not enough"}',
+                parsed_json={"detail": "not enough"},
+                model="primary-model",
+            )
+        ],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = SequenceAdapter(
+        [
+            ChatResponse(
+                content='{"answer":"ready"}',
+                parsed_json={"answer": "ready"},
+                model="backup-model",
+            )
+        ],
+        provider="anthropic",
+        model="backup-model",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary), Route("backup", backup)]),
+        result_policy=structured_policy,
+        failover_on_invalid_result=True,
+    )
+
+    response = llm.chat([])
+
+    assert response.selected_route == "backup"
+    assert response.parsed_json == {"answer": "ready"}
+    assert response.attempts[0].error_message.endswith(
+        "structured_output_missing_answer"
+    )
+
+
 def test_invalid_result_without_opt_in_is_returned_as_an_error():
     primary = SequenceAdapter(
         [ChatResponse(content="bad", model="primary-model")],

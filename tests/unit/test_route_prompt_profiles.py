@@ -117,17 +117,17 @@ def test_chat_applies_the_selected_route_profile_without_mutating_original_messa
     response = llm.chat(messages)
 
     assert response.selected_route == "backup"
-    assert primary.calls[0]["messages"] == (
+    assert primary.calls[0]["messages"] == [
         {"role": "system", "content": "Primary instructions"},
         {"role": "user", "content": "Hello"},
-    )
-    assert backup.calls[0]["messages"] == (
+    ]
+    assert backup.calls[0]["messages"] == [
         {
             "role": "system",
             "content": "Developer instructions:\nBackup instructions",
         },
         {"role": "user", "content": "Hello"},
-    )
+    ]
     assert messages == [{"role": "user", "content": "Hello"}]
 
 
@@ -149,6 +149,43 @@ def test_session_applies_profile_to_each_round_without_duplicating_it():
     assert first_messages.count({"role": "system", "content": "Route instructions"}) == 1
     assert continuation_messages.count(
         {"role": "system", "content": "Route instructions"}
+    ) == 1
+    assert session.checkpoint.messages == (
+        {"role": "user", "content": "Find user 42"},
+    )
+
+
+def test_checkpoint_replay_uses_the_target_route_profile():
+    primary = CaptureAdapter([tool_call_response(), LLMAPITimeoutError()])
+    backup = CaptureAdapter([ChatResponse(content="recovered", model="fake-model")])
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route(
+                    "primary",
+                    primary,
+                    prompt_profile=PromptProfile(system="Primary route"),
+                ),
+                Route(
+                    "backup",
+                    backup,
+                    prompt_profile=PromptProfile(system="Backup route"),
+                ),
+            ]
+        )
+    )
+    session = llm.session([{"role": "user", "content": "Find user 42"}])
+
+    session.start()
+    response = session.continue_with(ToolResult("call-1", "{\"active\": true}"))
+
+    assert response.selected_route == "backup"
+    assert backup.calls[0]["messages"][0] == {
+        "role": "system",
+        "content": "Backup route",
+    }
+    assert backup.calls[0]["messages"].count(
+        {"role": "system", "content": "Backup route"}
     ) == 1
     assert session.checkpoint.messages == (
         {"role": "user", "content": "Find user 42"},
