@@ -56,6 +56,25 @@ class PromptProfile:
             messages.append({"role": "developer", "content": self.developer})
         return tuple(messages)
 
+    def to_request_messages(self) -> Tuple[Dict[str, str], ...]:
+        """Return messages compatible with the current adapter contract.
+
+        ``llm-api-adapter`` exposes one provider-neutral instruction role:
+        ``system``.  Developer instructions are therefore kept explicit in
+        the profile contract but represented as a labeled section inside one
+        system message at the request boundary.
+        """
+
+        if self.is_empty:
+            return ()
+
+        sections = []
+        if self.system is not None:
+            sections.append(self.system)
+        if self.developer is not None:
+            sections.append(f"Developer instructions:\n{self.developer}")
+        return ({"role": "system", "content": "\n\n".join(sections)},)
+
     def apply_to(
         self,
         messages: Iterable[Mapping[str, Any]],
@@ -65,3 +84,37 @@ class PromptProfile:
         if isinstance(messages, (str, bytes, Mapping)):
             raise TypeError("messages must be an iterable of message mappings")
         return self.to_messages() + tuple(deepcopy(tuple(messages)))
+
+    def apply_to_request(self, messages: Iterable[Any]) -> Tuple[Any, ...]:
+        """Apply the profile using the adapter-compatible instruction role."""
+
+        if isinstance(messages, (str, bytes, Mapping)):
+            raise TypeError("messages must be an iterable of message objects")
+
+        normalized = list(deepcopy(tuple(messages)))
+        profile_messages = self.to_request_messages()
+        if not profile_messages:
+            return tuple(normalized)
+
+        profile_message = profile_messages[0]
+        for index, message in enumerate(normalized):
+            role = (
+                message.get("role")
+                if isinstance(message, dict)
+                else getattr(message, "role", None)
+            )
+            if role != "system":
+                continue
+
+            content = (
+                message.get("content")
+                if isinstance(message, dict)
+                else getattr(message, "content", "")
+            )
+            normalized[index] = {
+                "role": "system",
+                "content": f"{profile_message['content']}\n\n{content}",
+            }
+            return tuple(normalized)
+
+        return (profile_message, *normalized)

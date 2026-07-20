@@ -89,12 +89,16 @@ class ResilientLLM:
                     route=route,
                     include_previous_response=route_index == 0,
                 )
+                request_messages = self._build_request_messages(
+                    messages,
+                    route=route,
+                )
                 started_at = datetime.now(timezone.utc)
                 started_tick = perf_counter()
 
                 try:
                     response = route.adapter.chat(
-                        messages=messages,
+                        messages=request_messages,
                         **request_kwargs,
                     )
                 except Exception as error:
@@ -270,6 +274,14 @@ class ResilientLLM:
         if "timeout_s" not in request_kwargs and route.policy.timeout_s is not None:
             request_kwargs["timeout_s"] = route.policy.timeout_s
         return request_kwargs
+
+    @staticmethod
+    def _build_request_messages(messages: Any, *, route: Route) -> Any:
+        """Build isolated route messages when a prompt profile is configured."""
+
+        if route.prompt_profile is None:
+            return messages
+        return route.prompt_profile.apply_to_request(messages)
 
     def _make_attempt_record(
         self,

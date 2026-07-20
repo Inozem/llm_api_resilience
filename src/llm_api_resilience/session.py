@@ -260,7 +260,10 @@ class ResilientSession:
         started_tick = perf_counter()
         try:
             response = route.adapter.chat(
-                messages=messages,
+                messages=self._llm._build_request_messages(
+                    messages,
+                    route=route,
+                ),
                 **normalized_kwargs,
             )
         except Exception as error:
