@@ -4,9 +4,9 @@
 applications, built on top of
 [`llm-api-adapter`](https://github.com/Inozem/llm_api_adapter).
 
-The `v0.2.0` feature set adds retry and ordered failover between configured
-models and providers while preserving the original `messages` and request
-parameters.
+The `v0.3.0` feature set adds application-managed tool-calling sessions,
+provider-neutral checkpoints, and safe cross-provider replay on top of retry
+and ordered failover.
 
 ## How failover works
 
@@ -33,7 +33,8 @@ llm = ResilientLLM(
     )
 )
 
-response = llm.chat([{"role": "user", "content": "Hello"}])
+session = llm.session([{"role": "user", "content": "Hello"}])
+response = session.start()
 ```
 
 `RoutePolicy()` performs one attempt, preserving the `v0.1` behavior. When a
@@ -85,6 +86,11 @@ response = llm.chat([{"role": "user", "content": "Hello"}])
 assert response.selected_route == "fallback"
 ```
 
+This example uses `ResilientSession` even though no tools are configured. A
+text response completes the turn, and tools can be added later by passing a
+`tools` list to the same session API. `llm.chat()` remains available for
+simple one-shot requests.
+
 ## Observability
 
 Successful calls return a `ResilientChatResponse`, which remains compatible
@@ -98,6 +104,64 @@ If all retryable attempts fail, `FailoverExhaustedError` is raised. It exposes
 the aggregated `attempts` and the final `last_error`, which is also preserved
 as the exception cause. Its message contains route, provider, model, and
 error-type summaries without API keys or request bodies.
+
+## Chat sessions and optional tools
+
+`ResilientSession` manages one application-driven chat turn. Tools are
+optional: a text response completes the turn, while a tool call starts a
+continuation. The application still executes tools; the resilience layer
+stores the result, continues the conversation, and can replay the result if a
+retryable continuation failure requires another provider.
+
+```python
+import json
+
+from llm_api_resilience import ToolResult
+
+
+session = llm.session(
+    messages,
+    tools=tools,
+    tool_choice="auto",
+    max_tokens=1000,
+)
+
+response = session.start()
+while response.tool_calls:
+    results = []
+    for tool_call in response.tool_calls:
+        value = run_tool(tool_call.name, tool_call.arguments)
+        results.append(
+            ToolResult(
+                tool_call_id=tool_call.call_id or tool_call.name,
+                content=json.dumps(value),
+            )
+        )
+    # Send tool results back to the model. The response is either another
+    # tool request or the final natural-language answer.
+    response = session.continue_with(results)
+
+final_response = response
+print(final_response.content)
+```
+
+Before the first tool round, the session captures a provider-neutral
+checkpoint. A same-route continuation can reuse `previous_response`. If that
+continuation fails with a retryable error, the session restores the checkpoint,
+tries the next route, and reuses completed tool results through its
+`ToolExecutionJournal`.
+
+For a side-effecting tool, provide an idempotency key so the result can be
+replayed safely:
+
+```python
+ToolResult(
+    tool_call_id=tool_call.call_id,
+    content=json.dumps(value),
+    idempotency_key="payment-123",
+    replay_policy="side_effecting",
+)
+```
 
 ## Custom failure classification
 
@@ -115,13 +179,12 @@ llm = ResilientLLM(
 )
 ```
 
-## Limitations in `v0.2.0`
+## Limitations in `v0.3.0`
 
-This version covers synchronous ordinary `chat()` calls. It does not yet
-provide async execution, streaming, circuit breakers, prompt profiles,
-result-based fallback, automatic tool execution, tool checkpoints, or
-cross-provider tool replay. Tool-call responses are returned as ordinary
-responses without automatic execution or replay.
+This version covers synchronous `chat()` calls and application-managed tool
+loops. It does not yet provide async execution, streaming, circuit breakers,
+prompt profiles, result-based fallback, or automatic tool execution. Tool
+execution remains the application's responsibility.
 
 ## E2E tests
 
@@ -136,6 +199,20 @@ pytest -m e2e
 
 Cases without a configured key are skipped. The local `.env` file is ignored
 by Git and must not contain committed credentials.
+
+## Real multi-provider example
+
+The repository includes a runnable example using real
+`UniversalLLMAPIAdapter` instances for OpenAI, Anthropic, and Google:
+
+```bash
+python -m pip install -e ".[test]"
+python examples/multi_provider_tool_failover.py
+```
+
+Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` in `.env`
+before running it. The example executes a tool once and demonstrates how the
+session continues and replays the result when a later route is required.
 
 ## License
 
