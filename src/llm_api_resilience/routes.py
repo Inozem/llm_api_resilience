@@ -1,18 +1,20 @@
 """Route and recovery-plan contracts."""
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
+from .circuit_breaker import CircuitBreaker
 from .policies import RoutePolicy
 
 
 @dataclass(frozen=True)
 class Route:
-    """A named adapter and the policy used to execute it."""
+    """A named adapter, execution policy, and optional circuit breaker."""
 
     name: str
     adapter: Any
     policy: RoutePolicy = field(default_factory=RoutePolicy)
+    breaker: Optional[CircuitBreaker] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -24,6 +26,10 @@ class Route:
             raise TypeError("adapter must provide a callable chat method")
         if not isinstance(self.policy, RoutePolicy):
             raise TypeError("policy must be a RoutePolicy")
+        if self.breaker is not None and not isinstance(
+            self.breaker, CircuitBreaker
+        ):
+            raise TypeError("breaker must be a CircuitBreaker or None")
 
 
 @dataclass(frozen=True)
@@ -57,3 +63,10 @@ class RecoveryPlan:
 
     def __getitem__(self, index: int) -> Route:
         return self.routes[index]
+
+    def reset_breakers(self) -> None:
+        """Reset every configured route breaker in the recovery plan."""
+
+        for route in self.routes:
+            if route.breaker is not None:
+                route.breaker.reset()

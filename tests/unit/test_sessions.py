@@ -6,6 +6,10 @@ from llm_api_adapter.models.tools import ToolCall
 from llm_api_adapter.models.messages.chat_message import AIMessage, ToolMessage
 
 from llm_api_resilience import (
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
+    FailoverExhaustedError,
     RecoveryPlan,
     ResilientChatResponse,
     ResilientLLM,
@@ -36,6 +40,17 @@ class SequenceAdapter:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class FakeClock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 def tool_call_response(*, call_id="call-1", model="gpt-test"):
@@ -88,6 +103,136 @@ def test_session_returns_tool_call_and_continues_with_application_result():
     assert isinstance(continuation_messages[2], ToolMessage)
     assert continuation_messages[2].tool_call_id == "call-1"
     assert adapter.calls[1]["previous_response"] is first
+
+
+def test_session_start_skips_open_route_and_uses_backup():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    breaker.record_failure()
+    primary = SequenceAdapter([ChatResponse(content="unused", model="gpt-test")])
+    backup = SequenceAdapter([ChatResponse(content="backup", model="backup-test")])
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    response = llm.session([]).start()
+
+    assert response.selected_route == "backup"
+    assert primary.calls == []
+    assert len(backup.calls) == 1
+
+
+def test_session_continuation_failure_opens_breaker_and_replays_checkpoint():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    primary = SequenceAdapter([tool_call_response(), LLMAPITimeoutError()])
+    backup = SequenceAdapter(
+        [
+            tool_call_response(call_id="call-2", model="backup-test"),
+            ChatResponse(content="recovered", model="backup-test"),
+        ],
+        provider="anthropic",
+        model="backup-test",
+    )
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+    session = llm.session([])
+    session.start()
+
+    response = session.continue_with(ToolResult("call-1", "ok"))
+
+    assert response.content == "recovered"
+    assert breaker.state is CircuitState.OPEN
+    assert len(primary.calls) == 2
+    assert len(backup.calls) == 2
+    assert [attempt.route_name for attempt in session.attempts] == [
+        "primary",
+        "primary",
+        "backup",
+        "backup",
+    ]
+    assert [event.event_type for event in session.events] == ["opened"]
+    assert response.events == session.events
+
+
+def test_session_half_open_probe_can_recover_same_route_continuation():
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10, clock=clock)
+    first = tool_call_response()
+    final = ChatResponse(content="recovered", model="gpt-test")
+    adapter = SequenceAdapter([first, LLMAPITimeoutError(), final])
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", adapter, breaker=breaker)])
+    )
+    session = llm.session([])
+    session.start()
+    result = ToolResult("call-1", "ok")
+
+    with pytest.raises(LLMAPITimeoutError):
+        session.continue_with(result)
+
+    assert breaker.state is CircuitState.OPEN
+    assert [event.event_type for event in session.events] == ["opened"]
+    clock.advance(10)
+    response = session.continue_with(result)
+
+    assert response.content == "recovered"
+    assert breaker.state is CircuitState.CLOSED
+    assert len(adapter.calls) == 3
+    assert [event.event_type for event in session.events] == [
+        "opened",
+        "half_open",
+        "closed",
+    ]
+    assert response.events == session.events
+
+
+def test_session_does_not_call_open_route_during_checkpoint_replay():
+    primary_breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    backup_breaker = CircuitBreaker(failure_threshold=1, cooldown_s=60)
+    backup_breaker.record_failure()
+    primary = SequenceAdapter([tool_call_response(), LLMAPITimeoutError()])
+    backup = SequenceAdapter([ChatResponse(content="unused", model="backup-test")])
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup, breaker=backup_breaker),
+            ]
+        )
+    )
+    session = llm.session([])
+    session.start()
+
+    with pytest.raises(FailoverExhaustedError):
+        session.continue_with(ToolResult("call-1", "ok"))
+
+    assert backup.calls == []
+    assert len(session.attempts) == 2
+
+
+def test_session_raises_circuit_error_when_active_route_is_open_without_backup():
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30, clock=clock)
+    primary = SequenceAdapter([tool_call_response(), LLMAPITimeoutError()])
+    llm = ResilientLLM(RecoveryPlan([Route("primary", primary, breaker=breaker)]))
+    session = llm.session([])
+    session.start()
+
+    with pytest.raises(LLMAPITimeoutError):
+        session.continue_with(ToolResult("call-1", "ok"))
+
+    with pytest.raises(CircuitOpenError, match="circuit is open"):
+        session.continue_with(ToolResult("call-1", "ok"))
 
 
 def test_session_can_accept_a_single_tool_result_object():
@@ -154,6 +299,25 @@ def test_session_records_continuation_failure_and_reraises_original_error():
     assert raised.value is error
     assert [attempt.success for attempt in session.attempts] == [True, False]
     assert llm.last_attempts == session.attempts
+
+
+def test_non_retryable_session_error_does_not_open_route_breaker():
+    from llm_api_adapter.errors import LLMAPIAuthorizationError
+
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    primary = SequenceAdapter(
+        [tool_call_response(), LLMAPIAuthorizationError()]
+    )
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary, breaker=breaker)])
+    )
+    session = llm.session([])
+    session.start()
+
+    with pytest.raises(LLMAPIAuthorizationError):
+        session.continue_with(ToolResult("call-1", "ok"))
+
+    assert breaker.state is CircuitState.CLOSED
 
 
 def test_session_retries_same_continuation_without_duplicate_messages():

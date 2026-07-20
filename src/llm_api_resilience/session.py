@@ -11,7 +11,9 @@ from llm_api_adapter.models.responses.chat_response import ChatResponse
 
 from .attempts import AttemptRecord
 from .checkpoints import Checkpoint, RouteIdentity
-from .errors import FailoverExhaustedError, SessionStateError
+from .circuit_breaker import CircuitState
+from .errors import CircuitOpenError, FailoverExhaustedError, SessionStateError
+from .observability import CircuitEvent
 from .responses import ResilientChatResponse
 from .routes import Route
 
@@ -79,6 +81,7 @@ class ResilientSession:
         self._working_messages: List[Any] = list(deepcopy(initial_messages))
         self._request_kwargs = deepcopy(dict(request_kwargs))
         self._attempts: List[AttemptRecord] = []
+        self._events: List[CircuitEvent] = []
         self._checkpoint: Optional[Checkpoint] = None
         self._active_route: Optional[Route] = None
         self._active_route_index: Optional[int] = None
@@ -111,6 +114,12 @@ class ResilientSession:
         return tuple(self._attempts)
 
     @property
+    def events(self) -> Tuple[CircuitEvent, ...]:
+        """All safe circuit-breaker events emitted by this session."""
+
+        return tuple(self._events)
+
+    @property
     def response(self) -> Optional[ResilientChatResponse]:
         """The most recent response returned by the session."""
 
@@ -141,9 +150,11 @@ class ResilientSession:
         )
         self._response = response
         self._attempts = list(response.attempts)
+        self._events = list(response.events)
         self._active_route = self._route_for_response(response)
         self._response_route_identity = self._route_identity(self._active_route)
         self._llm._last_attempts = tuple(self._attempts)
+        self._llm._last_events = tuple(self._events)
 
         if response.tool_calls:
             self._checkpoint = Checkpoint.capture(
@@ -189,7 +200,13 @@ class ResilientSession:
                 include_previous_response=True,
             )
         except Exception as error:
-            if self._llm.failure_classifier.is_retryable(error) and self._has_next_route:
+            if (
+                (
+                    isinstance(error, CircuitOpenError)
+                    or self._llm.failure_classifier.is_retryable(error)
+                )
+                and self._has_next_route
+            ):
                 return self._replay_from_checkpoint(error)
             raise
 
@@ -214,6 +231,16 @@ class ResilientSession:
         include_previous_response: bool,
     ) -> ResilientChatResponse:
         """Call one route and append safe attempt metadata."""
+
+        if not self._llm._allow_route_request(route, self._events):
+            cooldown_remaining_s = (
+                route.breaker.snapshot().cooldown_remaining_s
+                if route.breaker is not None
+                else 0.0
+            )
+            raise CircuitOpenError(
+                cooldown_remaining_s=cooldown_remaining_s,
+            )
 
         normalized_kwargs = self._llm._build_request_kwargs(
             request_kwargs,
@@ -246,6 +273,8 @@ class ResilientSession:
             )
             self._attempts.append(attempt)
             self._llm._last_attempts = tuple(self._attempts)
+            if self._llm.failure_classifier.is_retryable(error):
+                self._llm._record_route_failure(route, error, self._events)
             raise
 
         attempt = self._llm._make_attempt_record(
@@ -256,12 +285,14 @@ class ResilientSession:
         )
         self._attempts.append(attempt)
         self._llm._last_attempts = tuple(self._attempts)
+        self._llm._record_route_success(route, self._events)
         self._active_route = route
         self._response_route_identity = route_identity
         self._response = ResilientChatResponse.from_chat_response(
             response,
             selected_route=route.name,
             attempts=tuple(self._attempts),
+            events=tuple(self._events),
         )
         return self._response
 
@@ -287,6 +318,7 @@ class ResilientSession:
             len(self._llm.recovery_plan),
         ):
             route = self._llm.recovery_plan[route_index]
+
             self._active_route = route
             self._active_route_index = route_index
 
@@ -300,9 +332,19 @@ class ResilientSession:
                     )
                 except Exception as error:
                     last_route_error = error
-                    if not self._llm.failure_classifier.is_retryable(error):
+                    if not (
+                        isinstance(error, CircuitOpenError)
+                        or self._llm.failure_classifier.is_retryable(error)
+                    ):
                         raise
-                    if failed_attempt >= route.policy.max_attempts:
+                    if (
+                        failed_attempt >= route.policy.max_attempts
+                        or isinstance(error, CircuitOpenError)
+                        or (
+                            route.breaker is not None
+                            and route.breaker.state is CircuitState.OPEN
+                        )
+                    ):
                         break
                     delay_s = route.policy.backoff_for(failed_attempt)
                     if delay_s > 0:

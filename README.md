@@ -4,9 +4,10 @@
 applications, built on top of
 [`llm-api-adapter`](https://github.com/Inozem/llm_api_adapter).
 
-The `v0.3.0` feature set adds application-managed tool-calling sessions,
-provider-neutral checkpoints, and safe cross-provider replay on top of retry
-and ordered failover.
+The `v0.4.0` feature set adds route-level circuit breakers and safe
+observability on top of retry, ordered failover, application-managed
+tool-calling sessions, provider-neutral checkpoints, and cross-provider
+replay.
 
 ## How failover works
 
@@ -105,6 +106,53 @@ the aggregated `attempts` and the final `last_error`, which is also preserved
 as the exception cause. Its message contains route, provider, model, and
 error-type summaries without API keys or request bodies.
 
+Responses also expose `events`, while `ResilientLLM.last_events` contains the
+events from the latest operation. A session exposes its accumulated events
+through `session.events`. Circuit events contain only route, provider, model,
+state, event type, error type, timestamp, and cooldown metadata. They never
+contain API keys, request bodies, raw responses, or complete error messages.
+
+## Circuit breakers
+
+Add a breaker to a route when a provider should be temporarily removed from
+rotation after repeated failures:
+
+```python
+from llm_api_resilience import CircuitBreaker, RecoveryPlan, ResilientLLM, Route
+
+primary_breaker = CircuitBreaker(
+    failure_threshold=3,
+    cooldown_s=30,
+)
+
+llm = ResilientLLM(
+    RecoveryPlan(
+        [
+            Route("primary", primary_adapter, breaker=primary_breaker),
+            Route("backup", backup_adapter),
+        ]
+    )
+)
+```
+
+The breaker moves through three states:
+
+- `closed` - requests are allowed;
+- `open` - requests are skipped during the cooldown;
+- `half_open` - one probe request checks whether the route recovered.
+
+A successful probe closes the breaker. A failed probe opens it again. Breaker
+state is shared by all sessions using the same `ResilientLLM` instance. To
+manually reset every configured route breaker:
+
+```python
+llm.recovery_plan.reset_breakers()
+```
+
+Only errors classified as retryable by the configured `FailureClassifier`
+increment the breaker. Non-retryable errors are raised immediately and do not
+open the circuit.
+
 ## Chat sessions and optional tools
 
 `ResilientSession` manages one application-driven chat turn. Tools are
@@ -179,12 +227,18 @@ llm = ResilientLLM(
 )
 ```
 
-## Limitations in `v0.3.0`
+## Limitations in `v0.4.0`
 
-This version covers synchronous `chat()` calls and application-managed tool
-loops. It does not yet provide async execution, streaming, circuit breakers,
+This version covers synchronous `chat()` calls, application-managed tool
+loops, and in-memory circuit breakers. It does not yet provide async
+execution, streaming, distributed breaker state, thread-safe coordination,
 prompt profiles, result-based fallback, or automatic tool execution. Tool
 execution remains the application's responsibility.
+
+Circuit state is local to the process that owns the `ResilientLLM` instance.
+If a service runs multiple workers, each worker can make an independent route
+decision. A shared state backend and distributed half-open coordination are
+planned for a future production-hardening version.
 
 ## E2E tests
 
@@ -201,6 +255,16 @@ Cases without a configured key are skipped. The local `.env` file is ignored
 by Git and must not contain committed credentials.
 
 ## Real multi-provider example
+
+The repository also includes an offline circuit-breaker example that requires
+no API keys or network access:
+
+```bash
+python examples/circuit_breaker_observability.py
+```
+
+It demonstrates an initial failover, skipping an open primary route, and a
+successful half-open recovery probe.
 
 The repository includes a runnable example using real
 `UniversalLLMAPIAdapter` instances for OpenAI, Anthropic, and Google:

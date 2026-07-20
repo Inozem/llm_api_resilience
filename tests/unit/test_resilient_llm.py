@@ -13,6 +13,9 @@ from llm_api_adapter.models.responses.chat_response import ChatResponse
 from llm_api_adapter.models.tools import ToolCall
 
 from llm_api_resilience import (
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
     RecoveryPlan,
     FailoverExhaustedError,
     ResilientChatResponse,
@@ -54,6 +57,17 @@ class SequenceFakeAdapter:
         return outcome
 
 
+class FakeClock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 def make_llm(adapter, *, timeout_s=None, backup=None):
     routes = [Route("primary", adapter, RoutePolicy(timeout_s=timeout_s))]
     if backup is not None:
@@ -75,6 +89,209 @@ def test_resilient_llm_delegates_to_first_route_and_returns_compatible_response(
     assert adapter.calls[0]["messages"] is messages
     assert adapter.calls[0]["temperature"] == 0.2
     assert adapter.calls[0]["tools"] == ["tool"]
+
+
+def test_open_route_is_skipped_and_backup_route_handles_request():
+    clock = FakeClock()
+    primary_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=30,
+        clock=clock,
+    )
+    primary_breaker.record_failure()
+    primary = FakeAdapter(provider="openai")
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    response = llm.chat([])
+
+    assert response.selected_route == "backup"
+    assert primary.calls == []
+    assert len(backup.calls) == 1
+    assert [attempt.route_name for attempt in response.attempts] == ["backup"]
+
+
+def test_failed_route_opens_breaker_and_is_skipped_on_next_request():
+    primary_breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError()],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = FakeAdapter(provider="anthropic", model="backup-model")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    first_response = llm.chat([])
+    second_response = llm.chat([])
+
+    assert first_response.selected_route == "backup"
+    assert second_response.selected_route == "backup"
+    assert len(primary.calls) == 1
+    assert len(backup.calls) == 2
+    assert primary_breaker.state is CircuitState.OPEN
+
+
+def test_chat_exposes_circuit_events_and_last_events():
+    clock = FakeClock()
+    primary_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=10,
+        clock=clock,
+    )
+    primary = SequenceFakeAdapter(
+        [
+            LLMAPITimeoutError(),
+            ChatResponse(content="primary recovered", model="primary-model"),
+        ],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = FakeAdapter(provider="anthropic", model="backup-model")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    first_response = llm.chat([])
+    second_response = llm.chat([])
+    clock.advance(10)
+    third_response = llm.chat([])
+
+    assert [event.event_type for event in first_response.events] == ["opened"]
+    assert [event.event_type for event in second_response.events] == ["skipped"]
+    assert [event.event_type for event in third_response.events] == [
+        "half_open",
+        "closed",
+    ]
+    assert first_response.events[0].route_name == "primary"
+    assert first_response.events[0].provider == "openai"
+    assert first_response.events[0].model == "primary-model"
+    assert first_response.events[0].error_type == "LLMAPITimeoutError"
+    assert [attempt.route_name for attempt in first_response.attempts] == [
+        "primary",
+        "backup",
+    ]
+    assert [attempt.success for attempt in first_response.attempts] == [
+        False,
+        True,
+    ]
+    assert llm.last_events == third_response.events
+
+
+def test_breaker_opening_stops_remaining_retries_for_current_route():
+    primary_breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    primary = SequenceFakeAdapter(
+        [LLMAPITimeoutError(), LLMAPITimeoutError()],
+        provider="openai",
+    )
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route(
+                    "primary",
+                    primary,
+                    RoutePolicy(max_attempts=3),
+                    primary_breaker,
+                ),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    response = llm.chat([])
+
+    assert response.selected_route == "backup"
+    assert len(primary.calls) == 1
+    assert [attempt.route_name for attempt in response.attempts] == [
+        "primary",
+        "backup",
+    ]
+
+
+def test_half_open_route_is_probed_and_closes_after_success():
+    clock = FakeClock()
+    primary_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=10,
+        clock=clock,
+    )
+    primary_breaker.record_failure()
+    primary = FakeAdapter(provider="openai")
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    clock.advance(10)
+    response = llm.chat([])
+
+    assert response.selected_route == "primary"
+    assert len(primary.calls) == 1
+    assert backup.calls == []
+    assert primary_breaker.state is CircuitState.CLOSED
+
+
+def test_all_open_routes_raise_safe_circuit_error_without_api_calls():
+    clock = FakeClock()
+    primary_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=30,
+        clock=clock,
+    )
+    backup_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=60,
+        clock=clock,
+    )
+    primary_breaker.record_failure()
+    backup_breaker.record_failure()
+    primary = FakeAdapter(provider="openai")
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup, breaker=backup_breaker),
+            ]
+        )
+    )
+
+    with pytest.raises(CircuitOpenError, match="circuit is open") as error:
+        llm.chat([])
+
+    assert error.value.cooldown_remaining_s == pytest.approx(30)
+    assert primary.calls == []
+    assert backup.calls == []
+    assert llm.last_attempts == ()
+    assert [event.event_type for event in llm.last_events] == [
+        "skipped",
+        "skipped",
+    ]
+    assert all(event.state is CircuitState.OPEN for event in llm.last_events)
 
 
 def test_resilient_llm_forwards_chat_kwargs_without_mutating_original_kwargs():
@@ -259,6 +476,27 @@ def test_resilient_llm_does_not_fail_over_non_retryable_errors():
     assert backup.calls == []
     assert len(llm.last_attempts) == 1
     assert llm.last_attempts[0].success is False
+
+
+def test_non_retryable_error_does_not_open_route_breaker():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    authorization_error = LLMAPIAuthorizationError()
+    primary = FakeAdapter(error=authorization_error, provider="openai")
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    with pytest.raises(LLMAPIAuthorizationError):
+        llm.chat([])
+
+    assert breaker.state is CircuitState.CLOSED
+    assert backup.calls == []
 
 
 def test_resilient_llm_uses_custom_classifier_for_retry_decisions():

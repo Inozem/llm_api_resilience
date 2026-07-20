@@ -3,7 +3,9 @@
 from .attempts import AdapterProtocol, AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .checkpoints import Checkpoint, RouteIdentity
-from .errors import FailoverExhaustedError, SessionStateError
+from .circuit_breaker import CircuitBreaker, CircuitSnapshot, CircuitState
+from .errors import CircuitOpenError, FailoverExhaustedError, SessionStateError
+from .observability import CircuitEvent
 from .policies import RoutePolicy
 from .responses import ResilientChatResponse
 from .resilient_llm import ResilientLLM
@@ -16,6 +18,11 @@ __version__ = "0.1.0"
 __all__ = [
     "AdapterProtocol",
     "AttemptRecord",
+    "CircuitBreaker",
+    "CircuitEvent",
+    "CircuitOpenError",
+    "CircuitSnapshot",
+    "CircuitState",
     "DefaultFailureClassifier",
     "FailoverExhaustedError",
     "FailureClassifier",
