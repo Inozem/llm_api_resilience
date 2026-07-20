@@ -5,10 +5,24 @@ from time import perf_counter, sleep
 from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
+from .capabilities import (
+    CapabilityRequirements,
+    normalize_capability_requirements,
+)
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .circuit_breaker import CircuitState
-from .errors import CircuitOpenError, FailoverExhaustedError, InvalidResultError
-from .observability import CircuitEvent
+from .errors import (
+    CapabilityMismatchError,
+    CircuitOpenError,
+    FailoverExhaustedError,
+    InvalidResultError,
+    NoCompatibleRouteError,
+)
+from .observability import (
+    CapabilitySkipEvent,
+    CircuitEvent,
+    ObservabilityEvent,
+)
 from .responses import ResilientChatResponse
 from .result_policies import evaluate_result_policy, normalize_result_policy
 from .routes import RecoveryPlan, Route
@@ -44,7 +58,7 @@ class ResilientLLM:
         self._result_policy = normalized_result_policy
         self._failover_on_invalid_result = failover_on_invalid_result
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
-        self._last_events: Tuple[CircuitEvent, ...] = ()
+        self._last_events: Tuple[ObservabilityEvent, ...] = ()
 
     @property
     def recovery_plan(self) -> RecoveryPlan:
@@ -59,7 +73,7 @@ class ResilientLLM:
         return self._last_attempts
 
     @property
-    def last_events(self) -> Tuple[CircuitEvent, ...]:
+    def last_events(self) -> Tuple[ObservabilityEvent, ...]:
         """Safe circuit-breaker events from the most recent operation."""
 
         return self._last_events
@@ -82,24 +96,60 @@ class ResilientLLM:
 
         return self._failover_on_invalid_result
 
-    def session(self, messages: Any, *, journal: Any = None, **kwargs: Any):
+    def session(
+        self,
+        messages: Any,
+        *,
+        journal: Any = None,
+        capability_requirements: Optional[CapabilityRequirements] = None,
+        **kwargs: Any,
+    ):
         """Create an application-managed session for tool-calling recovery."""
 
         from .session import ResilientSession
 
-        return ResilientSession(self, messages, kwargs, journal=journal)
+        return ResilientSession(
+            self,
+            messages,
+            kwargs,
+            journal=journal,
+            capability_requirements=capability_requirements,
+        )
 
-    def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
+    def chat(
+        self,
+        messages: Any,
+        *,
+        capability_requirements: Optional[CapabilityRequirements] = None,
+        **kwargs: Any,
+    ) -> ResilientChatResponse:
         """Retry transient failures and fail over through the route order."""
 
+        requirements = normalize_capability_requirements(capability_requirements)
         attempts = []
         last_error: Optional[Exception] = None
         blocked_cooldowns = []
+        capability_skips = []
+        eligible_route_seen = False
         self._last_attempts = ()
         events = []
         self._last_events = ()
 
         for route_index, route in enumerate(self._recovery_plan):
+            missing_capabilities = self._missing_route_capabilities(
+                route,
+                requirements,
+            )
+            if missing_capabilities:
+                event = self._record_capability_skip(
+                    route,
+                    missing_capabilities,
+                    events,
+                )
+                capability_skips.append(event)
+                continue
+            eligible_route_seen = True
+
             if not self._allow_route_request(route, events):
                 if route.breaker is not None:
                     blocked_cooldowns.append(
@@ -204,7 +254,43 @@ class ResilientLLM:
             raise FailoverExhaustedError(attempts, last_error) from last_error
         if blocked_cooldowns:
             raise CircuitOpenError(cooldown_remaining_s=min(blocked_cooldowns))
+        if capability_skips and not eligible_route_seen:
+            raise NoCompatibleRouteError(requirements, capability_skips)
         raise RuntimeError("recovery plan did not execute any route")
+
+    @staticmethod
+    def _missing_route_capabilities(
+        route: Route,
+        requirements: CapabilityRequirements,
+    ) -> Tuple[str, ...]:
+        if requirements.is_empty or route.capabilities is None:
+            return ()
+        return route.capabilities.missing(requirements)
+
+    def _record_capability_skip(
+        self,
+        route: Route,
+        missing_capabilities: Tuple[str, ...],
+        events: list,
+    ) -> CapabilitySkipEvent:
+        event = self._make_capability_skip_event(route, missing_capabilities)
+        events.append(event)
+        self._last_events = tuple(events)
+        return event
+
+    def _ensure_route_capabilities(
+        self,
+        route: Route,
+        requirements: CapabilityRequirements,
+        events: list,
+    ) -> None:
+        missing_capabilities = self._missing_route_capabilities(
+            route,
+            requirements,
+        )
+        if missing_capabilities:
+            self._record_capability_skip(route, missing_capabilities, events)
+            raise CapabilityMismatchError(route.name, missing_capabilities)
 
     def _allow_route_request(self, route: Route, events: list) -> bool:
         breaker = route.breaker
@@ -306,6 +392,23 @@ class ResilientLLM:
             model=model,
             error_type=type(error).__name__ if error is not None else None,
             cooldown_remaining_s=cooldown_remaining_s,
+        )
+
+    def _make_capability_skip_event(
+        self,
+        route: Route,
+        missing_capabilities: Tuple[str, ...],
+    ) -> CapabilitySkipEvent:
+        adapter = route.adapter
+        provider = self._get_adapter_string(adapter, "organization")
+        if provider is None:
+            provider = self._get_adapter_string(adapter, "company")
+        model = self._get_adapter_string(adapter, "model")
+        return CapabilitySkipEvent(
+            route_name=route.name,
+            missing_capabilities=missing_capabilities,
+            provider=provider,
+            model=model,
         )
 
     @staticmethod

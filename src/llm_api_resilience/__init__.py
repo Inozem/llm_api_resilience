@@ -1,16 +1,23 @@
 """Resilience primitives for multi-provider LLM applications."""
 
 from .attempts import AdapterProtocol, AttemptRecord
+from .capabilities import (
+    CapabilityRequirements,
+    RouteCapabilities,
+    capability_names,
+)
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .checkpoints import Checkpoint, RouteIdentity
 from .circuit_breaker import CircuitBreaker, CircuitSnapshot, CircuitState
 from .errors import (
+    CapabilityMismatchError,
     CircuitOpenError,
     FailoverExhaustedError,
     InvalidResultError,
+    NoCompatibleRouteError,
     SessionStateError,
 )
-from .observability import CircuitEvent
+from .observability import CapabilitySkipEvent, CircuitEvent
 from .policies import RoutePolicy
 from .prompt_profiles import PromptProfile
 from .responses import ResilientChatResponse
@@ -30,6 +37,9 @@ __version__ = "0.1.0"
 __all__ = [
     "AdapterProtocol",
     "AttemptRecord",
+    "CapabilityMismatchError",
+    "CapabilityRequirements",
+    "CapabilitySkipEvent",
     "CircuitBreaker",
     "CircuitEvent",
     "CircuitOpenError",
@@ -39,12 +49,14 @@ __all__ = [
     "FailoverExhaustedError",
     "FailureClassifier",
     "InvalidResultError",
+    "NoCompatibleRouteError",
     "PromptProfile",
     "Checkpoint",
     "RecoveryPlan",
     "Route",
     "RouteIdentity",
     "RoutePolicy",
+    "RouteCapabilities",
     "ResilientSession",
     "ResilientChatResponse",
     "ResilientLLM",
@@ -57,5 +69,6 @@ __all__ = [
     "ToolExecutionJournal",
     "ToolExecutionRecord",
     "ToolResult",
+    "capability_names",
     "__version__",
 ]

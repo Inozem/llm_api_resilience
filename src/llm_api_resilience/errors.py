@@ -1,8 +1,9 @@
 """Errors raised by the resilience layer."""
 
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 from .attempts import AttemptRecord
+from .capabilities import CapabilityRequirements
 
 
 class SessionStateError(RuntimeError):
@@ -59,6 +60,61 @@ class InvalidResultError(RuntimeError):
         super().__init__(
             f"invalid result from {route_name} "
             f"[{provider_name}/{model_name}]: {reason_type}"
+        )
+
+
+class CapabilityMismatchError(RuntimeError):
+    """Raised when one route lacks a request's required capabilities."""
+
+    def __init__(self, route_name: str, missing_capabilities: Iterable[str]) -> None:
+        if not isinstance(route_name, str):
+            raise TypeError("route_name must be a string")
+        if not route_name.strip():
+            raise ValueError("route_name must not be empty")
+        missing = tuple(missing_capabilities)
+        if not missing:
+            raise ValueError("missing_capabilities must not be empty")
+        if any(not isinstance(name, str) or not name.strip() for name in missing):
+            raise ValueError("missing_capabilities must contain non-empty strings")
+
+        self.route_name = route_name
+        self.missing_capabilities = missing
+        super().__init__(
+            f"route {route_name} lacks capabilities: {', '.join(missing)}"
+        )
+
+
+class NoCompatibleRouteError(RuntimeError):
+    """Raised when no declared route satisfies request capabilities."""
+
+    def __init__(
+        self,
+        requirements: CapabilityRequirements,
+        skipped_routes: Iterable[Any],
+    ) -> None:
+        if not isinstance(requirements, CapabilityRequirements):
+            raise TypeError("requirements must be CapabilityRequirements")
+        normalized_skips = tuple(skipped_routes)
+        if not normalized_skips:
+            raise ValueError("skipped_routes must contain at least one event")
+        if any(
+            getattr(event, "event_type", None) != "capability_skipped"
+            for event in normalized_skips
+        ):
+            raise TypeError("skipped_routes must contain capability skip events")
+
+        self.requirements = requirements
+        self.skipped_routes = normalized_skips
+        requested = ", ".join(requirements.requested())
+        skipped = "; ".join(
+            f"{event.route_name} [{event.provider or 'unknown-provider'}/"
+            f"{event.model or 'unknown-model'}] missing "
+            f"{','.join(event.missing_capabilities)}"
+            for event in normalized_skips
+        )
+        super().__init__(
+            f"no compatible route for capabilities: {requested}. "
+            f"Skipped: {skipped}"
         )
 
 
