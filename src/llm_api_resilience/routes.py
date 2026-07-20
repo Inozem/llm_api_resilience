@@ -51,6 +51,9 @@ class RecoveryPlan:
     routes: Tuple[Route, ...]
 
     def __post_init__(self) -> None:
+        if isinstance(self.routes, (str, bytes, bytearray)):
+            raise TypeError("routes must be an iterable of Route objects")
+
         try:
             routes = tuple(self.routes)
         except TypeError as exc:
@@ -64,6 +67,12 @@ class RecoveryPlan:
         names = [route.name for route in routes]
         if len(names) != len(set(names)):
             raise ValueError("route names must be unique")
+
+        breakers = [route.breaker for route in routes if route.breaker is not None]
+        if len(breakers) != len({id(breaker) for breaker in breakers}):
+            raise ValueError(
+                "each route in a recovery plan must have its own circuit breaker"
+            )
 
         object.__setattr__(self, "routes", routes)
 
