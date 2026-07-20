@@ -7,10 +7,10 @@ from typing import Any, Dict, Optional, Tuple
 from .attempts import AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .circuit_breaker import CircuitState
-from .errors import CircuitOpenError, FailoverExhaustedError
+from .errors import CircuitOpenError, FailoverExhaustedError, InvalidResultError
 from .observability import CircuitEvent
 from .responses import ResilientChatResponse
-from .result_policies import normalize_result_policy
+from .result_policies import evaluate_result_policy, normalize_result_policy
 from .routes import RecoveryPlan, Route
 
 
@@ -22,6 +22,7 @@ class ResilientLLM:
         recovery_plan: RecoveryPlan,
         failure_classifier: Optional[FailureClassifier] = None,
         result_policy: Any = None,
+        failover_on_invalid_result: bool = False,
     ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
@@ -31,9 +32,17 @@ class ResilientLLM:
             raise TypeError(
                 "failure_classifier must provide an is_retryable method"
             )
+        if not isinstance(failover_on_invalid_result, bool):
+            raise TypeError("failover_on_invalid_result must be a boolean")
+        normalized_result_policy = normalize_result_policy(result_policy)
+        if failover_on_invalid_result and normalized_result_policy is None:
+            raise ValueError(
+                "failover_on_invalid_result requires a result_policy"
+            )
         self._recovery_plan = recovery_plan
         self._failure_classifier = failure_classifier
-        self._result_policy = normalize_result_policy(result_policy)
+        self._result_policy = normalized_result_policy
+        self._failover_on_invalid_result = failover_on_invalid_result
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
         self._last_events: Tuple[CircuitEvent, ...] = ()
 
@@ -66,6 +75,12 @@ class ResilientLLM:
         """Optional policy configured for result validation."""
 
         return self._result_policy
+
+    @property
+    def failover_on_invalid_result(self) -> bool:
+        """Whether a rejected result can move execution to another route."""
+
+        return self._failover_on_invalid_result
 
     def session(self, messages: Any, *, journal: Any = None, **kwargs: Any):
         """Create an application-managed session for tool-calling recovery."""
@@ -136,6 +151,31 @@ class ResilientLLM:
                             and route.breaker.state is CircuitState.OPEN
                         )
                     ):
+                        break
+
+                    delay_s = route.policy.backoff_for(failed_attempt)
+                    if delay_s > 0:
+                        sleep(delay_s)
+                    continue
+
+                try:
+                    self._validate_route_response(response, route=route)
+                except InvalidResultError as error:
+                    duration_s = perf_counter() - started_tick
+                    attempt = self._make_attempt_record(
+                        route=route,
+                        started_at=started_at,
+                        duration_s=duration_s,
+                        success=False,
+                        error=error,
+                    )
+                    attempts.append(attempt)
+                    self._last_attempts = tuple(attempts)
+                    last_error = error
+
+                    if not self._failover_on_invalid_result:
+                        raise
+                    if failed_attempt >= route.policy.max_attempts:
                         break
 
                     delay_s = route.policy.backoff_for(failed_attempt)
@@ -291,6 +331,38 @@ class ResilientLLM:
         if route.prompt_profile is None:
             return messages
         return route.prompt_profile.apply_to_request(messages)
+
+    def _validate_route_response(self, response: Any, *, route: Route) -> None:
+        """Validate one normalized adapter response when a policy is configured."""
+
+        if self._result_policy is None:
+            return
+
+        decision = evaluate_result_policy(self._result_policy, response)
+        if not decision.valid:
+            raise self._make_invalid_result_error(route, decision.reason_type)
+
+    def _make_invalid_result_error(
+        self,
+        route: Route,
+        reason_type: str,
+    ) -> InvalidResultError:
+        provider = self._get_adapter_string(route.adapter, "organization")
+        if provider is None:
+            provider = self._get_adapter_string(route.adapter, "company")
+        model = self._get_adapter_string(route.adapter, "model")
+        return InvalidResultError(
+            route.name,
+            provider=provider,
+            model=model,
+            reason_type=reason_type,
+        )
+
+    def _should_failover_invalid_result(self, error: Exception) -> bool:
+        return self._failover_on_invalid_result and isinstance(
+            error,
+            InvalidResultError,
+        )
 
     def _make_attempt_record(
         self,

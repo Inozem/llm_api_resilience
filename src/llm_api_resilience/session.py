@@ -204,6 +204,7 @@ class ResilientSession:
                 (
                     isinstance(error, CircuitOpenError)
                     or self._llm.failure_classifier.is_retryable(error)
+                    or self._llm._should_failover_invalid_result(error)
                 )
                 and self._has_next_route
             ):
@@ -280,6 +281,20 @@ class ResilientSession:
                 self._llm._record_route_failure(route, error, self._events)
             raise
 
+        try:
+            self._llm._validate_route_response(response, route=route)
+        except Exception as error:
+            attempt = self._llm._make_attempt_record(
+                route=route,
+                started_at=started_at,
+                duration_s=perf_counter() - started_tick,
+                success=False,
+                error=error,
+            )
+            self._attempts.append(attempt)
+            self._llm._last_attempts = tuple(self._attempts)
+            raise
+
         attempt = self._llm._make_attempt_record(
             route=route,
             started_at=started_at,
@@ -335,10 +350,12 @@ class ResilientSession:
                     )
                 except Exception as error:
                     last_route_error = error
-                    if not (
+                    is_recoverable = (
                         isinstance(error, CircuitOpenError)
                         or self._llm.failure_classifier.is_retryable(error)
-                    ):
+                        or self._llm._should_failover_invalid_result(error)
+                    )
+                    if not is_recoverable:
                         raise
                     if (
                         failed_attempt >= route.policy.max_attempts
