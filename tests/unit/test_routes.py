@@ -1,6 +1,12 @@
 import pytest
 
-from llm_api_resilience import RecoveryPlan, Route, RoutePolicy
+from llm_api_resilience import (
+    CircuitBreaker,
+    CircuitState,
+    RecoveryPlan,
+    Route,
+    RoutePolicy,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -19,7 +25,21 @@ def test_valid_route_uses_default_policy():
 
     assert route.name == "primary"
     assert route.policy == RoutePolicy()
+    assert route.breaker is None
     assert callable(route.adapter.chat)
+
+
+def test_route_accepts_optional_circuit_breaker():
+    breaker = CircuitBreaker(failure_threshold=2)
+
+    route = Route(name="primary", adapter=FakeAdapter(), breaker=breaker)
+
+    assert route.breaker is breaker
+
+
+def test_route_rejects_invalid_circuit_breaker():
+    with pytest.raises(TypeError, match="CircuitBreaker or None"):
+        Route(name="primary", adapter=FakeAdapter(), breaker=object())
 
 
 def test_route_rejects_empty_name():
@@ -51,6 +71,52 @@ def test_recovery_plan_preserves_order_and_is_immutable():
     assert [route.name for route in plan] == ["primary", "backup"]
     assert isinstance(plan.routes, tuple)
     assert len(plan) == 2
+
+
+def test_recovery_plan_resets_only_its_configured_route_breakers():
+    primary_breaker = CircuitBreaker(failure_threshold=1)
+    backup_breaker = CircuitBreaker(failure_threshold=1)
+    primary = Route(
+        name="primary",
+        adapter=FakeAdapter(),
+        breaker=primary_breaker,
+    )
+    backup = Route(
+        name="backup",
+        adapter=FakeAdapter(),
+        breaker=backup_breaker,
+    )
+    outside_breaker = CircuitBreaker(failure_threshold=1)
+
+    primary_breaker.record_failure()
+    backup_breaker.record_failure()
+    outside_breaker.record_failure()
+
+    RecoveryPlan([primary, backup]).reset_breakers()
+
+    assert primary_breaker.state is CircuitState.CLOSED
+    assert backup_breaker.state is CircuitState.CLOSED
+    assert outside_breaker.state is CircuitState.OPEN
+
+
+def test_route_breakers_keep_independent_state():
+    primary_breaker = CircuitBreaker(failure_threshold=1)
+    backup_breaker = CircuitBreaker(failure_threshold=1)
+    primary = Route(
+        name="primary",
+        adapter=FakeAdapter(),
+        breaker=primary_breaker,
+    )
+    backup = Route(
+        name="backup",
+        adapter=FakeAdapter(),
+        breaker=backup_breaker,
+    )
+
+    primary.breaker.record_failure()
+
+    assert primary.breaker.state is CircuitState.OPEN
+    assert backup.breaker.state is CircuitState.CLOSED
 
 
 def test_route_policy_accepts_multiple_attempts():
