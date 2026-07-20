@@ -14,6 +14,7 @@ from llm_api_resilience import (
     ResilientChatResponse,
     ResilientLLM,
     Route,
+    RoutePolicy,
     SessionStateError,
     ToolResult,
 )
@@ -339,6 +340,41 @@ def test_session_retries_same_continuation_without_duplicate_messages():
     assert adapter.calls[2]["previous_response"] is first_response
     assert len(adapter.calls[1]["messages"]) == len(adapter.calls[2]["messages"])
     assert [attempt.success for attempt in session.attempts] == [True, False, True]
+
+
+def test_session_uses_llm_sleeper_for_continuation_backoff():
+    primary = SequenceAdapter(
+        [tool_call_response(), LLMAPITimeoutError(detail="primary failed")]
+    )
+    backup = SequenceAdapter(
+        [
+            LLMAPITimeoutError(detail="backup temporary"),
+            ChatResponse(content="recovered", model="backup-test"),
+        ],
+        provider="anthropic",
+        model="backup-test",
+    )
+    sleeps = []
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary),
+                Route(
+                    "backup",
+                    backup,
+                    policy=RoutePolicy(max_attempts=2, backoff_s=0.5),
+                ),
+            ]
+        ),
+        sleeper=sleeps.append,
+    )
+    session = llm.session([])
+
+    session.start()
+    response = session.continue_with(ToolResult("call-1", "ok"))
+
+    assert response.content == "recovered"
+    assert sleeps == [0.5]
 
 
 def test_session_updates_previous_response_for_each_same_route_tool_round():
