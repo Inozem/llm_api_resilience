@@ -4,8 +4,9 @@
 applications, built on top of
 [`llm-api-adapter`](https://github.com/Inozem/llm_api_adapter).
 
-The `v0.4.0` feature set adds route-level circuit breakers and safe
-observability on top of retry, ordered failover, application-managed
+The `v0.5.0` feature set adds route-specific prompt profiles, result-level
+validation with opt-in failover, and declarative capability-aware routing on
+top of retry, ordered failover, circuit breakers, application-managed
 tool-calling sessions, provider-neutral checkpoints, and cross-provider
 replay.
 
@@ -92,6 +93,126 @@ text response completes the turn, and tools can be added later by passing a
 `tools` list to the same session API. `llm.chat()` remains available for
 simple one-shot requests.
 
+## Prompt profiles
+
+Attach different system/developer instructions to individual routes. The
+profile is applied at the request boundary, so the original messages and
+session checkpoint remain unchanged:
+
+```python
+from llm_api_resilience import PromptProfile
+
+llm = ResilientLLM(
+    RecoveryPlan(
+        [
+            Route(
+                "primary",
+                primary_adapter,
+                prompt_profile=PromptProfile(
+                    system="Answer as a concise expert.",
+                    developer="Prefer plain language.",
+                ),
+            ),
+            Route(
+                "backup",
+                backup_adapter,
+                prompt_profile=PromptProfile(
+                    system="Answer as a helpful fallback assistant.",
+                ),
+            ),
+        ]
+    )
+)
+```
+
+Profiles are immutable and are applied once per route attempt. During
+cross-route session replay, the target route's profile is used. The current
+`llm-api-adapter` boundary represents developer instructions as a labeled
+section of one system message so the same profile works across providers.
+
+## Result policies and result-level failover
+
+The adapter already supports structural JSON handling through `json_schema`,
+`response_model`, and `parsed_json`. `ResultPolicy` adds a separate,
+application-level check for a response that was technically successful but is
+not good enough for the business logic. For example, the JSON can be valid
+while its confidence is too low or its source is not trusted:
+
+```python
+from llm_api_adapter.models.responses.chat_response import ChatResponse
+from llm_api_resilience import ResultDecision
+
+
+def quality_policy(response: ChatResponse) -> ResultDecision:
+    payload = response.parsed_json or {}
+    valid = (
+        isinstance(payload.get("answer"), str)
+        and payload.get("confidence", 0) >= 0.8
+        and payload.get("source") == "verified-service"
+    )
+    return ResultDecision(
+        valid=valid,
+        reason_type="semantic_quality_threshold",
+    )
+
+
+llm = ResilientLLM(
+    recovery_plan,
+    result_policy=quality_policy,
+    failover_on_invalid_result=True,
+)
+response = llm.chat(messages)
+```
+
+With `failover_on_invalid_result=True`, an invalid response is recorded as a
+safe failed attempt and the next route is tried. The route's retry policy is
+still respected. Without the opt-in flag, `InvalidResultError` is raised and
+the backup route is not called. The policy never executes tools itself.
+
+`JSONSchemaError` is not automatically converted into result-level failover:
+the adapter can also use that error family for invalid schemas or client-side
+configuration errors. Use an explicit `ResultPolicy` when the application
+wants to treat a returned result as unacceptable.
+
+## Capability-aware routing
+
+Applications can declare route capabilities and request only routes that meet
+the current requirement:
+
+```python
+from llm_api_resilience import (
+    CapabilityRequirements,
+    RouteCapabilities,
+)
+
+llm = ResilientLLM(
+    RecoveryPlan(
+        [
+            Route(
+                "text",
+                text_adapter,
+                capabilities=RouteCapabilities(vision=False),
+            ),
+            Route(
+                "vision",
+                vision_adapter,
+                capabilities=RouteCapabilities(vision=True),
+            ),
+        ]
+    )
+)
+
+response = llm.chat(
+    messages,
+    capability_requirements=CapabilityRequirements(vision=True),
+)
+```
+
+Routes without capability metadata remain backward-compatible and are treated
+as unrestricted. Routes with declared missing capabilities are skipped before
+the adapter is called and produce a safe `CapabilitySkipEvent`. If every
+declared route is incompatible, `NoCompatibleRouteError` is raised.
+
 ## Observability
 
 Successful calls return a `ResilientChatResponse`, which remains compatible
@@ -109,8 +230,10 @@ error-type summaries without API keys or request bodies.
 Responses also expose `events`, while `ResilientLLM.last_events` contains the
 events from the latest operation. A session exposes its accumulated events
 through `session.events`. Circuit events contain only route, provider, model,
-state, event type, error type, timestamp, and cooldown metadata. They never
-contain API keys, request bodies, raw responses, or complete error messages.
+state, event type, error type, timestamp, and cooldown metadata. Capability
+skip events contain only route, provider, model, missing capabilities, and a
+timestamp. These records never contain API keys, request bodies, raw
+responses, or complete error messages.
 
 ## Circuit breakers
 
@@ -227,13 +350,14 @@ llm = ResilientLLM(
 )
 ```
 
-## Limitations in `v0.4.0`
+## Limitations in `v0.5.0`
 
 This version covers synchronous `chat()` calls, application-managed tool
-loops, and in-memory circuit breakers. It does not yet provide async
-execution, streaming, distributed breaker state, thread-safe coordination,
-prompt profiles, result-based fallback, or automatic tool execution. Tool
-execution remains the application's responsibility.
+loops, in-memory circuit breakers, prompt profiles, result policies, and
+capability-aware routing. It does not yet provide async execution, streaming,
+distributed breaker state, thread-safe coordination, automatic provider
+capability discovery, or automatic tool execution. Tool execution remains the
+application's responsibility.
 
 Circuit state is local to the process that owns the `ResilientLLM` instance.
 If a service runs multiple workers, each worker can make an independent route
@@ -265,6 +389,16 @@ python examples/circuit_breaker_observability.py
 
 It demonstrates an initial failover, skipping an open primary route, and a
 successful half-open recovery probe.
+
+The result-level failover demo is also fully offline:
+
+```bash
+python examples/invalid_result_failover.py
+```
+
+It uses two valid JSON responses with different business-quality metadata.
+The primary response has low confidence, so `ResultPolicy` rejects it and the
+backup route is selected. No API keys or network access are required.
 
 The repository includes a runnable example using real
 `UniversalLLMAPIAdapter` instances for OpenAI, Anthropic, and Google:

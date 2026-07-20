@@ -5,11 +5,26 @@ from time import perf_counter, sleep
 from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
+from .capabilities import (
+    CapabilityRequirements,
+    normalize_capability_requirements,
+)
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .circuit_breaker import CircuitState
-from .errors import CircuitOpenError, FailoverExhaustedError
-from .observability import CircuitEvent
+from .errors import (
+    CapabilityMismatchError,
+    CircuitOpenError,
+    FailoverExhaustedError,
+    InvalidResultError,
+    NoCompatibleRouteError,
+)
+from .observability import (
+    CapabilitySkipEvent,
+    CircuitEvent,
+    ObservabilityEvent,
+)
 from .responses import ResilientChatResponse
+from .result_policies import evaluate_result_policy, normalize_result_policy
 from .routes import RecoveryPlan, Route
 
 
@@ -20,6 +35,8 @@ class ResilientLLM:
         self,
         recovery_plan: RecoveryPlan,
         failure_classifier: Optional[FailureClassifier] = None,
+        result_policy: Any = None,
+        failover_on_invalid_result: bool = False,
     ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
@@ -29,10 +46,19 @@ class ResilientLLM:
             raise TypeError(
                 "failure_classifier must provide an is_retryable method"
             )
+        if not isinstance(failover_on_invalid_result, bool):
+            raise TypeError("failover_on_invalid_result must be a boolean")
+        normalized_result_policy = normalize_result_policy(result_policy)
+        if failover_on_invalid_result and normalized_result_policy is None:
+            raise ValueError(
+                "failover_on_invalid_result requires a result_policy"
+            )
         self._recovery_plan = recovery_plan
         self._failure_classifier = failure_classifier
+        self._result_policy = normalized_result_policy
+        self._failover_on_invalid_result = failover_on_invalid_result
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
-        self._last_events: Tuple[CircuitEvent, ...] = ()
+        self._last_events: Tuple[ObservabilityEvent, ...] = ()
 
     @property
     def recovery_plan(self) -> RecoveryPlan:
@@ -47,7 +73,7 @@ class ResilientLLM:
         return self._last_attempts
 
     @property
-    def last_events(self) -> Tuple[CircuitEvent, ...]:
+    def last_events(self) -> Tuple[ObservabilityEvent, ...]:
         """Safe circuit-breaker events from the most recent operation."""
 
         return self._last_events
@@ -58,24 +84,72 @@ class ResilientLLM:
 
         return self._failure_classifier
 
-    def session(self, messages: Any, *, journal: Any = None, **kwargs: Any):
+    @property
+    def result_policy(self) -> Any:
+        """Optional policy configured for result validation."""
+
+        return self._result_policy
+
+    @property
+    def failover_on_invalid_result(self) -> bool:
+        """Whether a rejected result can move execution to another route."""
+
+        return self._failover_on_invalid_result
+
+    def session(
+        self,
+        messages: Any,
+        *,
+        journal: Any = None,
+        capability_requirements: Optional[CapabilityRequirements] = None,
+        **kwargs: Any,
+    ):
         """Create an application-managed session for tool-calling recovery."""
 
         from .session import ResilientSession
 
-        return ResilientSession(self, messages, kwargs, journal=journal)
+        return ResilientSession(
+            self,
+            messages,
+            kwargs,
+            journal=journal,
+            capability_requirements=capability_requirements,
+        )
 
-    def chat(self, messages: Any, **kwargs: Any) -> ResilientChatResponse:
+    def chat(
+        self,
+        messages: Any,
+        *,
+        capability_requirements: Optional[CapabilityRequirements] = None,
+        **kwargs: Any,
+    ) -> ResilientChatResponse:
         """Retry transient failures and fail over through the route order."""
 
+        requirements = normalize_capability_requirements(capability_requirements)
         attempts = []
         last_error: Optional[Exception] = None
         blocked_cooldowns = []
+        capability_skips = []
+        eligible_route_seen = False
         self._last_attempts = ()
         events = []
         self._last_events = ()
 
         for route_index, route in enumerate(self._recovery_plan):
+            missing_capabilities = self._missing_route_capabilities(
+                route,
+                requirements,
+            )
+            if missing_capabilities:
+                event = self._record_capability_skip(
+                    route,
+                    missing_capabilities,
+                    events,
+                )
+                capability_skips.append(event)
+                continue
+            eligible_route_seen = True
+
             if not self._allow_route_request(route, events):
                 if route.breaker is not None:
                     blocked_cooldowns.append(
@@ -89,12 +163,16 @@ class ResilientLLM:
                     route=route,
                     include_previous_response=route_index == 0,
                 )
+                request_messages = self._build_request_messages(
+                    messages,
+                    route=route,
+                )
                 started_at = datetime.now(timezone.utc)
                 started_tick = perf_counter()
 
                 try:
                     response = route.adapter.chat(
-                        messages=messages,
+                        messages=request_messages,
                         **request_kwargs,
                     )
                 except Exception as error:
@@ -130,6 +208,31 @@ class ResilientLLM:
                         sleep(delay_s)
                     continue
 
+                try:
+                    self._validate_route_response(response, route=route)
+                except InvalidResultError as error:
+                    duration_s = perf_counter() - started_tick
+                    attempt = self._make_attempt_record(
+                        route=route,
+                        started_at=started_at,
+                        duration_s=duration_s,
+                        success=False,
+                        error=error,
+                    )
+                    attempts.append(attempt)
+                    self._last_attempts = tuple(attempts)
+                    last_error = error
+
+                    if not self._failover_on_invalid_result:
+                        raise
+                    if failed_attempt >= route.policy.max_attempts:
+                        break
+
+                    delay_s = route.policy.backoff_for(failed_attempt)
+                    if delay_s > 0:
+                        sleep(delay_s)
+                    continue
+
                 duration_s = perf_counter() - started_tick
                 attempt = self._make_attempt_record(
                     route=route,
@@ -151,7 +254,43 @@ class ResilientLLM:
             raise FailoverExhaustedError(attempts, last_error) from last_error
         if blocked_cooldowns:
             raise CircuitOpenError(cooldown_remaining_s=min(blocked_cooldowns))
+        if capability_skips and not eligible_route_seen:
+            raise NoCompatibleRouteError(requirements, capability_skips)
         raise RuntimeError("recovery plan did not execute any route")
+
+    @staticmethod
+    def _missing_route_capabilities(
+        route: Route,
+        requirements: CapabilityRequirements,
+    ) -> Tuple[str, ...]:
+        if requirements.is_empty or route.capabilities is None:
+            return ()
+        return route.capabilities.missing(requirements)
+
+    def _record_capability_skip(
+        self,
+        route: Route,
+        missing_capabilities: Tuple[str, ...],
+        events: list,
+    ) -> CapabilitySkipEvent:
+        event = self._make_capability_skip_event(route, missing_capabilities)
+        events.append(event)
+        self._last_events = tuple(events)
+        return event
+
+    def _ensure_route_capabilities(
+        self,
+        route: Route,
+        requirements: CapabilityRequirements,
+        events: list,
+    ) -> None:
+        missing_capabilities = self._missing_route_capabilities(
+            route,
+            requirements,
+        )
+        if missing_capabilities:
+            self._record_capability_skip(route, missing_capabilities, events)
+            raise CapabilityMismatchError(route.name, missing_capabilities)
 
     def _allow_route_request(self, route: Route, events: list) -> bool:
         breaker = route.breaker
@@ -255,6 +394,23 @@ class ResilientLLM:
             cooldown_remaining_s=cooldown_remaining_s,
         )
 
+    def _make_capability_skip_event(
+        self,
+        route: Route,
+        missing_capabilities: Tuple[str, ...],
+    ) -> CapabilitySkipEvent:
+        adapter = route.adapter
+        provider = self._get_adapter_string(adapter, "organization")
+        if provider is None:
+            provider = self._get_adapter_string(adapter, "company")
+        model = self._get_adapter_string(adapter, "model")
+        return CapabilitySkipEvent(
+            route_name=route.name,
+            missing_capabilities=missing_capabilities,
+            provider=provider,
+            model=model,
+        )
+
     @staticmethod
     def _build_request_kwargs(
         original_kwargs: Dict[str, Any],
@@ -270,6 +426,46 @@ class ResilientLLM:
         if "timeout_s" not in request_kwargs and route.policy.timeout_s is not None:
             request_kwargs["timeout_s"] = route.policy.timeout_s
         return request_kwargs
+
+    @staticmethod
+    def _build_request_messages(messages: Any, *, route: Route) -> Any:
+        """Build isolated route messages when a prompt profile is configured."""
+
+        if route.prompt_profile is None:
+            return messages
+        return list(route.prompt_profile.apply_to_request(messages))
+
+    def _validate_route_response(self, response: Any, *, route: Route) -> None:
+        """Validate one normalized adapter response when a policy is configured."""
+
+        if self._result_policy is None:
+            return
+
+        decision = evaluate_result_policy(self._result_policy, response)
+        if not decision.valid:
+            raise self._make_invalid_result_error(route, decision.reason_type)
+
+    def _make_invalid_result_error(
+        self,
+        route: Route,
+        reason_type: str,
+    ) -> InvalidResultError:
+        provider = self._get_adapter_string(route.adapter, "organization")
+        if provider is None:
+            provider = self._get_adapter_string(route.adapter, "company")
+        model = self._get_adapter_string(route.adapter, "model")
+        return InvalidResultError(
+            route.name,
+            provider=provider,
+            model=model,
+            reason_type=reason_type,
+        )
+
+    def _should_failover_invalid_result(self, error: Exception) -> bool:
+        return self._failover_on_invalid_result and isinstance(
+            error,
+            InvalidResultError,
+        )
 
     def _make_attempt_record(
         self,

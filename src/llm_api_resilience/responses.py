@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple
 from llm_api_adapter.models.responses.chat_response import ChatResponse
 
 from .attempts import AttemptRecord
-from .observability import CircuitEvent
+from .observability import CapabilitySkipEvent, CircuitEvent, ObservabilityEvent
 
 
 @dataclass
@@ -15,7 +15,7 @@ class ResilientChatResponse(ChatResponse):
 
     selected_route: Optional[str] = None
     attempts: Tuple[AttemptRecord, ...] = field(default_factory=tuple)
-    events: Tuple[CircuitEvent, ...] = field(default_factory=tuple)
+    events: Tuple[ObservabilityEvent, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.selected_route is not None:
@@ -30,8 +30,13 @@ class ResilientChatResponse(ChatResponse):
         self.attempts = attempts
 
         events = tuple(self.events)
-        if any(not isinstance(event, CircuitEvent) for event in events):
-            raise TypeError("events must contain CircuitEvent objects")
+        if any(
+            not isinstance(event, (CircuitEvent, CapabilitySkipEvent))
+            for event in events
+        ):
+            raise TypeError(
+                "events must contain CircuitEvent or CapabilitySkipEvent objects"
+            )
         self.events = events
 
     @classmethod
@@ -41,7 +46,7 @@ class ResilientChatResponse(ChatResponse):
         *,
         selected_route: Optional[str] = None,
         attempts: Iterable[AttemptRecord] = (),
-        events: Iterable[CircuitEvent] = (),
+        events: Iterable[ObservabilityEvent] = (),
     ) -> "ResilientChatResponse":
         """Wrap an adapter response without dropping normalized response fields."""
 

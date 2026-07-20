@@ -3,18 +3,22 @@
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Tuple
 
+from .capabilities import RouteCapabilities
 from .circuit_breaker import CircuitBreaker
 from .policies import RoutePolicy
+from .prompt_profiles import PromptProfile
 
 
 @dataclass(frozen=True)
 class Route:
-    """A named adapter, execution policy, and optional circuit breaker."""
+    """A named adapter, execution policy, and optional prompt profile."""
 
     name: str
     adapter: Any
     policy: RoutePolicy = field(default_factory=RoutePolicy)
     breaker: Optional[CircuitBreaker] = None
+    prompt_profile: Optional[PromptProfile] = None
+    capabilities: Optional[RouteCapabilities] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -30,6 +34,14 @@ class Route:
             self.breaker, CircuitBreaker
         ):
             raise TypeError("breaker must be a CircuitBreaker or None")
+        if self.prompt_profile is not None and not isinstance(
+            self.prompt_profile, PromptProfile
+        ):
+            raise TypeError("prompt_profile must be a PromptProfile or None")
+        if self.capabilities is not None and not isinstance(
+            self.capabilities, RouteCapabilities
+        ):
+            raise TypeError("capabilities must be RouteCapabilities or None")
 
 
 @dataclass(frozen=True)
