@@ -5,6 +5,10 @@ from typing import Iterable, Tuple
 from .attempts import AttemptRecord
 
 
+class SessionStateError(RuntimeError):
+    """Raised when a tool session operation is invalid for its current state."""
+
+
 class FailoverExhaustedError(Exception):
     """Raised when every retryable route attempt has failed.
 
