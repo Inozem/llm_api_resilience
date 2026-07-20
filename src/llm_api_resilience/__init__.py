@@ -7,6 +7,7 @@ from .circuit_breaker import CircuitBreaker, CircuitSnapshot, CircuitState
 from .errors import CircuitOpenError, FailoverExhaustedError, SessionStateError
 from .observability import CircuitEvent
 from .policies import RoutePolicy
+from .prompt_profiles import PromptProfile
 from .responses import ResilientChatResponse
 from .resilient_llm import ResilientLLM
 from .routes import RecoveryPlan, Route
@@ -26,6 +27,7 @@ __all__ = [
     "DefaultFailureClassifier",
     "FailoverExhaustedError",
     "FailureClassifier",
+    "PromptProfile",
     "Checkpoint",
     "RecoveryPlan",
     "Route",
