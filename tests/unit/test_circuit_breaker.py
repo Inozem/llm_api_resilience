@@ -125,3 +125,62 @@ def test_breaker_rejects_invalid_configuration(kwargs, error_type, message):
 def test_circuit_open_error_rejects_invalid_cooldown_metadata():
     with pytest.raises(ValueError, match="non-negative"):
         CircuitOpenError(cooldown_remaining_s=-1)
+
+
+@pytest.mark.parametrize(
+    "failure_count, expected_state, expected_allowed",
+    [
+        (0, CircuitState.CLOSED, True),
+        (1, CircuitState.CLOSED, True),
+        (2, CircuitState.OPEN, False),
+    ],
+)
+def test_failure_threshold_matrix(failure_count, expected_state, expected_allowed):
+    breaker = CircuitBreaker(failure_threshold=2, cooldown_s=10)
+
+    for _ in range(failure_count):
+        breaker.record_failure()
+
+    assert breaker.state is expected_state
+    assert breaker.allow_request() is expected_allowed
+
+
+def test_cooldown_requires_full_interval_before_half_open_probe():
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10, clock=clock)
+    breaker.record_failure()
+
+    clock.advance(9.999)
+    assert breaker.allow_request() is False
+    assert breaker.snapshot().cooldown_remaining_s > 0
+
+    clock.advance(0.001)
+    assert breaker.allow_request() is True
+    assert breaker.allow_request() is False
+
+
+def test_success_in_closed_state_resets_consecutive_failure_counter():
+    breaker = CircuitBreaker(failure_threshold=3, cooldown_s=10)
+
+    breaker.record_failure()
+    breaker.record_failure()
+    breaker.record_success()
+    breaker.record_failure()
+    breaker.record_failure()
+
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.failure_count == 2
+
+
+def test_reset_releases_reserved_half_open_probe():
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10, clock=clock)
+    breaker.record_failure()
+    clock.advance(10)
+    assert breaker.allow_request() is True
+    assert breaker.allow_request() is False
+
+    breaker.reset()
+
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.allow_request() is True

@@ -181,12 +181,19 @@ def test_session_half_open_probe_can_recover_same_route_continuation():
         session.continue_with(result)
 
     assert breaker.state is CircuitState.OPEN
+    assert [event.event_type for event in session.events] == ["opened"]
     clock.advance(10)
     response = session.continue_with(result)
 
     assert response.content == "recovered"
     assert breaker.state is CircuitState.CLOSED
     assert len(adapter.calls) == 3
+    assert [event.event_type for event in session.events] == [
+        "opened",
+        "half_open",
+        "closed",
+    ]
+    assert response.events == session.events
 
 
 def test_session_does_not_call_open_route_during_checkpoint_replay():

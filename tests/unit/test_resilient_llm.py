@@ -185,6 +185,14 @@ def test_chat_exposes_circuit_events_and_last_events():
     assert first_response.events[0].provider == "openai"
     assert first_response.events[0].model == "primary-model"
     assert first_response.events[0].error_type == "LLMAPITimeoutError"
+    assert [attempt.route_name for attempt in first_response.attempts] == [
+        "primary",
+        "backup",
+    ]
+    assert [attempt.success for attempt in first_response.attempts] == [
+        False,
+        True,
+    ]
     assert llm.last_events == third_response.events
 
 
@@ -279,6 +287,11 @@ def test_all_open_routes_raise_safe_circuit_error_without_api_calls():
     assert primary.calls == []
     assert backup.calls == []
     assert llm.last_attempts == ()
+    assert [event.event_type for event in llm.last_events] == [
+        "skipped",
+        "skipped",
+    ]
+    assert all(event.state is CircuitState.OPEN for event in llm.last_events)
 
 
 def test_resilient_llm_forwards_chat_kwargs_without_mutating_original_kwargs():
