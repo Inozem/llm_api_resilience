@@ -145,6 +145,49 @@ def test_failed_route_opens_breaker_and_is_skipped_on_next_request():
     assert primary_breaker.state is CircuitState.OPEN
 
 
+def test_chat_exposes_circuit_events_and_last_events():
+    clock = FakeClock()
+    primary_breaker = CircuitBreaker(
+        failure_threshold=1,
+        cooldown_s=10,
+        clock=clock,
+    )
+    primary = SequenceFakeAdapter(
+        [
+            LLMAPITimeoutError(),
+            ChatResponse(content="primary recovered", model="primary-model"),
+        ],
+        provider="openai",
+        model="primary-model",
+    )
+    backup = FakeAdapter(provider="anthropic", model="backup-model")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=primary_breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    first_response = llm.chat([])
+    second_response = llm.chat([])
+    clock.advance(10)
+    third_response = llm.chat([])
+
+    assert [event.event_type for event in first_response.events] == ["opened"]
+    assert [event.event_type for event in second_response.events] == ["skipped"]
+    assert [event.event_type for event in third_response.events] == [
+        "half_open",
+        "closed",
+    ]
+    assert first_response.events[0].route_name == "primary"
+    assert first_response.events[0].provider == "openai"
+    assert first_response.events[0].model == "primary-model"
+    assert first_response.events[0].error_type == "LLMAPITimeoutError"
+    assert llm.last_events == third_response.events
+
+
 def test_breaker_opening_stops_remaining_retries_for_current_route():
     primary_breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
     primary = SequenceFakeAdapter(

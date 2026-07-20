@@ -160,6 +160,8 @@ def test_session_continuation_failure_opens_breaker_and_replays_checkpoint():
         "backup",
         "backup",
     ]
+    assert [event.event_type for event in session.events] == ["opened"]
+    assert response.events == session.events
 
 
 def test_session_half_open_probe_can_recover_same_route_continuation():

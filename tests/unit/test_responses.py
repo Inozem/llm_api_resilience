@@ -3,7 +3,12 @@ import pytest
 from llm_api_adapter.models.responses.chat_response import ChatResponse, Usage
 from llm_api_adapter.models.tools import ToolCall
 
-from llm_api_resilience import AttemptRecord, ResilientChatResponse
+from llm_api_resilience import (
+    AttemptRecord,
+    CircuitEvent,
+    CircuitState,
+    ResilientChatResponse,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -68,6 +73,24 @@ def test_resilient_response_contains_selected_route_and_attempts():
 
     assert response.selected_route == "primary"
     assert response.attempts == (attempt,)
+
+
+def test_resilient_response_contains_safe_circuit_events():
+    event = CircuitEvent(
+        event_type="opened",
+        route_name="primary",
+        state=CircuitState.OPEN,
+        provider="openai",
+        model="gpt-test",
+        error_type="LLMAPITimeoutError",
+    )
+
+    response = ResilientChatResponse.from_chat_response(
+        make_base_response(),
+        events=[event],
+    )
+
+    assert response.events == (event,)
 
 
 def test_resilient_response_does_not_drop_tool_calls_or_structured_output():

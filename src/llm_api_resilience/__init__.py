@@ -5,6 +5,7 @@ from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .checkpoints import Checkpoint, RouteIdentity
 from .circuit_breaker import CircuitBreaker, CircuitSnapshot, CircuitState
 from .errors import CircuitOpenError, FailoverExhaustedError, SessionStateError
+from .observability import CircuitEvent
 from .policies import RoutePolicy
 from .responses import ResilientChatResponse
 from .resilient_llm import ResilientLLM
@@ -18,6 +19,7 @@ __all__ = [
     "AdapterProtocol",
     "AttemptRecord",
     "CircuitBreaker",
+    "CircuitEvent",
     "CircuitOpenError",
     "CircuitSnapshot",
     "CircuitState",

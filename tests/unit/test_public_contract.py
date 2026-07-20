@@ -4,6 +4,7 @@ from llm_api_resilience import (
     AdapterProtocol,
     AttemptRecord,
     CircuitBreaker,
+    CircuitEvent,
     CircuitOpenError,
     CircuitSnapshot,
     CircuitState,
@@ -24,6 +25,7 @@ def test_v01_public_exports_are_available():
     assert AdapterProtocol is not None
     assert AttemptRecord is not None
     assert CircuitBreaker is not None
+    assert CircuitEvent is not None
     assert CircuitOpenError is not None
     assert CircuitSnapshot is not None
     assert CircuitState is not None
