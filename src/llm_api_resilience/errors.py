@@ -9,6 +9,24 @@ class SessionStateError(RuntimeError):
     """Raised when a tool session operation is invalid for its current state."""
 
 
+class CircuitOpenError(RuntimeError):
+    """Raised when a circuit breaker rejects a request."""
+
+    def __init__(self, cooldown_remaining_s: float = 0.0) -> None:
+        if isinstance(cooldown_remaining_s, bool) or not isinstance(
+            cooldown_remaining_s, (int, float)
+        ):
+            raise TypeError("cooldown_remaining_s must be a non-negative number")
+        if cooldown_remaining_s < 0:
+            raise ValueError("cooldown_remaining_s must be non-negative")
+
+        self.cooldown_remaining_s = float(cooldown_remaining_s)
+        super().__init__(
+            "circuit is open; retry in "
+            f"{self.cooldown_remaining_s:.3f} seconds"
+        )
+
+
 class FailoverExhaustedError(Exception):
     """Raised when every retryable route attempt has failed.
 
