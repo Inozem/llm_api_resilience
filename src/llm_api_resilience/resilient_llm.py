@@ -10,6 +10,7 @@ from .circuit_breaker import CircuitState
 from .errors import CircuitOpenError, FailoverExhaustedError
 from .observability import CircuitEvent
 from .responses import ResilientChatResponse
+from .result_policies import normalize_result_policy
 from .routes import RecoveryPlan, Route
 
 
@@ -20,6 +21,7 @@ class ResilientLLM:
         self,
         recovery_plan: RecoveryPlan,
         failure_classifier: Optional[FailureClassifier] = None,
+        result_policy: Any = None,
     ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
@@ -31,6 +33,7 @@ class ResilientLLM:
             )
         self._recovery_plan = recovery_plan
         self._failure_classifier = failure_classifier
+        self._result_policy = normalize_result_policy(result_policy)
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
         self._last_events: Tuple[CircuitEvent, ...] = ()
 
@@ -57,6 +60,12 @@ class ResilientLLM:
         """Classifier used for retry and failover decisions."""
 
         return self._failure_classifier
+
+    @property
+    def result_policy(self) -> Any:
+        """Optional policy configured for result validation."""
+
+        return self._result_policy
 
     def session(self, messages: Any, *, journal: Any = None, **kwargs: Any):
         """Create an application-managed session for tool-calling recovery."""

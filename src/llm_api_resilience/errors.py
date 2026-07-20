@@ -1,6 +1,6 @@
 """Errors raised by the resilience layer."""
 
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 from .attempts import AttemptRecord
 
@@ -24,6 +24,41 @@ class CircuitOpenError(RuntimeError):
         super().__init__(
             "circuit is open; retry in "
             f"{self.cooldown_remaining_s:.3f} seconds"
+        )
+
+
+class InvalidResultError(RuntimeError):
+    """Raised when an opted-in result policy rejects a model response."""
+
+    def __init__(
+        self,
+        route_name: str,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        reason_type: str = "invalid_result",
+    ) -> None:
+        if not isinstance(route_name, str):
+            raise TypeError("route_name must be a string")
+        if not route_name.strip():
+            raise ValueError("route_name must not be empty")
+        for field_name, value in (("provider", provider), ("model", model)):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string or None")
+        if not isinstance(reason_type, str):
+            raise TypeError("reason_type must be a string")
+        if not reason_type.strip():
+            raise ValueError("reason_type must not be empty")
+
+        self.route_name = route_name
+        self.provider = provider
+        self.model = model
+        self.reason_type = reason_type
+        provider_name = provider or "unknown-provider"
+        model_name = model or "unknown-model"
+        super().__init__(
+            f"invalid result from {route_name} "
+            f"[{provider_name}/{model_name}]: {reason_type}"
         )
 
 

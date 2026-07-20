@@ -4,11 +4,22 @@ from .attempts import AdapterProtocol, AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
 from .checkpoints import Checkpoint, RouteIdentity
 from .circuit_breaker import CircuitBreaker, CircuitSnapshot, CircuitState
-from .errors import CircuitOpenError, FailoverExhaustedError, SessionStateError
+from .errors import (
+    CircuitOpenError,
+    FailoverExhaustedError,
+    InvalidResultError,
+    SessionStateError,
+)
 from .observability import CircuitEvent
 from .policies import RoutePolicy
 from .prompt_profiles import PromptProfile
 from .responses import ResilientChatResponse
+from .result_policies import (
+    ResultDecision,
+    ResultPolicy,
+    ResultPolicyCallback,
+    evaluate_result_policy,
+)
 from .resilient_llm import ResilientLLM
 from .routes import RecoveryPlan, Route
 from .session import ResilientSession, ToolResult
@@ -27,6 +38,7 @@ __all__ = [
     "DefaultFailureClassifier",
     "FailoverExhaustedError",
     "FailureClassifier",
+    "InvalidResultError",
     "PromptProfile",
     "Checkpoint",
     "RecoveryPlan",
@@ -36,6 +48,10 @@ __all__ = [
     "ResilientSession",
     "ResilientChatResponse",
     "ResilientLLM",
+    "ResultDecision",
+    "ResultPolicy",
+    "ResultPolicyCallback",
+    "evaluate_result_policy",
     "ReplayPolicy",
     "SessionStateError",
     "ToolExecutionJournal",
