@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 
 from llm_api_resilience import (
@@ -184,3 +187,32 @@ def test_reset_releases_reserved_half_open_probe():
 
     assert breaker.state is CircuitState.CLOSED
     assert breaker.allow_request() is True
+
+
+def test_half_open_allows_exactly_one_concurrent_probe():
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=10, clock=clock)
+    breaker.record_failure()
+    clock.advance(10)
+    barrier = Barrier(8)
+
+    def try_request(_):
+        barrier.wait(timeout=5)
+        return breaker.allow_request()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(try_request, range(8)))
+
+    assert sum(results) == 1
+    assert breaker.state is CircuitState.HALF_OPEN
+
+
+def test_concurrent_failures_do_not_overshoot_threshold():
+    breaker = CircuitBreaker(failure_threshold=8)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(lambda _: breaker.record_failure(), range(64)))
+
+    snapshot = breaker.snapshot()
+    assert snapshot.state is CircuitState.OPEN
+    assert snapshot.failure_count == 8
