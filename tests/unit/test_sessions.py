@@ -301,6 +301,25 @@ def test_session_records_continuation_failure_and_reraises_original_error():
     assert llm.last_attempts == session.attempts
 
 
+def test_non_retryable_session_error_does_not_open_route_breaker():
+    from llm_api_adapter.errors import LLMAPIAuthorizationError
+
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    primary = SequenceAdapter(
+        [tool_call_response(), LLMAPIAuthorizationError()]
+    )
+    llm = ResilientLLM(
+        RecoveryPlan([Route("primary", primary, breaker=breaker)])
+    )
+    session = llm.session([])
+    session.start()
+
+    with pytest.raises(LLMAPIAuthorizationError):
+        session.continue_with(ToolResult("call-1", "ok"))
+
+    assert breaker.state is CircuitState.CLOSED
+
+
 def test_session_retries_same_continuation_without_duplicate_messages():
     error = LLMAPITimeoutError(detail="temporary")
     first = tool_call_response()

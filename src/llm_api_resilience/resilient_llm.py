@@ -109,9 +109,11 @@ class ResilientLLM:
                     attempts.append(attempt)
                     self._last_attempts = tuple(attempts)
                     last_error = error
-                    self._record_route_failure(route, error, events)
+                    is_retryable = self._failure_classifier.is_retryable(error)
+                    if is_retryable:
+                        self._record_route_failure(route, error, events)
 
-                    if not self._failure_classifier.is_retryable(error):
+                    if not is_retryable:
                         raise
 
                     if (

@@ -478,6 +478,27 @@ def test_resilient_llm_does_not_fail_over_non_retryable_errors():
     assert llm.last_attempts[0].success is False
 
 
+def test_non_retryable_error_does_not_open_route_breaker():
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    authorization_error = LLMAPIAuthorizationError()
+    primary = FakeAdapter(error=authorization_error, provider="openai")
+    backup = FakeAdapter(provider="anthropic")
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route("primary", primary, breaker=breaker),
+                Route("backup", backup),
+            ]
+        )
+    )
+
+    with pytest.raises(LLMAPIAuthorizationError):
+        llm.chat([])
+
+    assert breaker.state is CircuitState.CLOSED
+    assert backup.calls == []
+
+
 def test_resilient_llm_uses_custom_classifier_for_retry_decisions():
     class RetryValueErrorClassifier:
         def is_retryable(self, error):

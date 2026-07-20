@@ -273,7 +273,8 @@ class ResilientSession:
             )
             self._attempts.append(attempt)
             self._llm._last_attempts = tuple(self._attempts)
-            self._llm._record_route_failure(route, error, self._events)
+            if self._llm.failure_classifier.is_retryable(error):
+                self._llm._record_route_failure(route, error, self._events)
             raise
 
         attempt = self._llm._make_attempt_record(
