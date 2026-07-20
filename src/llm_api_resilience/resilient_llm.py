@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
 from .classifiers import DefaultFailureClassifier, FailureClassifier
-from .errors import FailoverExhaustedError
+from .circuit_breaker import CircuitState
+from .errors import CircuitOpenError, FailoverExhaustedError
 from .responses import ResilientChatResponse
 from .routes import RecoveryPlan, Route
 
@@ -61,8 +62,16 @@ class ResilientLLM:
 
         attempts = []
         last_error: Optional[Exception] = None
+        blocked_cooldowns = []
+        self._last_attempts = ()
 
         for route_index, route in enumerate(self._recovery_plan):
+            if route.breaker is not None and not route.breaker.allow_request():
+                blocked_cooldowns.append(
+                    route.breaker.snapshot().cooldown_remaining_s
+                )
+                continue
+
             for failed_attempt in range(1, route.policy.max_attempts + 1):
                 request_kwargs = self._build_request_kwargs(
                     kwargs,
@@ -89,11 +98,19 @@ class ResilientLLM:
                     attempts.append(attempt)
                     self._last_attempts = tuple(attempts)
                     last_error = error
+                    if route.breaker is not None:
+                        route.breaker.record_failure()
 
                     if not self._failure_classifier.is_retryable(error):
                         raise
 
-                    if failed_attempt >= route.policy.max_attempts:
+                    if (
+                        failed_attempt >= route.policy.max_attempts
+                        or (
+                            route.breaker is not None
+                            and route.breaker.state is CircuitState.OPEN
+                        )
+                    ):
                         break
 
                     delay_s = route.policy.backoff_for(failed_attempt)
@@ -110,6 +127,8 @@ class ResilientLLM:
                 )
                 attempts.append(attempt)
                 self._last_attempts = tuple(attempts)
+                if route.breaker is not None:
+                    route.breaker.record_success()
                 return ResilientChatResponse.from_chat_response(
                     response,
                     selected_route=route.name,
@@ -118,6 +137,8 @@ class ResilientLLM:
 
         if last_error is not None:
             raise FailoverExhaustedError(attempts, last_error) from last_error
+        if blocked_cooldowns:
+            raise CircuitOpenError(cooldown_remaining_s=min(blocked_cooldowns))
         raise RuntimeError("recovery plan did not execute any route")
 
     @staticmethod
