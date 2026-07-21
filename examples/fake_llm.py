@@ -48,7 +48,7 @@ def build_safe_route_backup() -> ScriptedAdapter:
         model="backup-model",
         outcomes=[
             ChatResponse(
-                content="Инцидент обработан безопасным резервным маршрутом.",
+                content="The incident was handled safely through the backup route.",
                 model="backup-model",
             )
         ],
