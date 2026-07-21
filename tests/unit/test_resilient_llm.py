@@ -387,6 +387,35 @@ def test_resilient_llm_retries_same_route_and_returns_all_attempts(monkeypatch):
     assert len(primary.calls) == 2
 
 
+def test_resilient_llm_uses_injected_sleeper_for_backoff():
+    primary = SequenceFakeAdapter(
+        [LLMAPIRateLimitError(detail="busy"), ChatResponse(content="ok")]
+    )
+    sleeps = []
+    llm = ResilientLLM(
+        RecoveryPlan(
+            [
+                Route(
+                    "primary",
+                    primary,
+                    RoutePolicy(max_attempts=2, backoff_s=0.25),
+                )
+            ]
+        ),
+        sleeper=sleeps.append,
+    )
+
+    response = llm.chat([])
+
+    assert response.content == "ok"
+    assert sleeps == [0.25]
+
+
+def test_resilient_llm_rejects_non_callable_sleeper():
+    with pytest.raises(TypeError, match="sleeper must be callable"):
+        ResilientLLM(RecoveryPlan([Route("primary", FakeAdapter())]), sleeper=object())
+
+
 def test_resilient_llm_fails_over_after_route_attempts_are_exhausted():
     primary = SequenceFakeAdapter(
         [LLMAPITimeoutError(), LLMAPIServerError()],

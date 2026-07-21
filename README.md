@@ -4,11 +4,14 @@
 applications, built on top of
 [`llm-api-adapter`](https://github.com/Inozem/llm_api_adapter).
 
-The `v0.5.0` feature set adds route-specific prompt profiles, result-level
-validation with opt-in failover, and declarative capability-aware routing on
-top of retry, ordered failover, circuit breakers, application-managed
-tool-calling sessions, provider-neutral checkpoints, and cross-provider
-replay.
+The `v0.6.0` feature set hardens the production behavior of the existing
+resilience layer: recovery plans validate their configuration early, circuit
+breakers are safe to share across threads in one process, and retry timing can
+be injected for deterministic tests. It also includes compatibility coverage
+for `llm-api-adapter` 0.5.x, while retaining route-specific prompt profiles,
+result-level validation with opt-in failover, and declarative capability-aware
+routing on top of ordered failover, application-managed tool-calling sessions,
+provider-neutral checkpoints, and cross-provider replay.
 
 ## How failover works
 
@@ -44,6 +47,16 @@ retryable error occurs, the same route is retried up to `max_attempts`. After
 the final attempt, the next route is tried. Backoff is applied only before a
 next attempt; the delay sequence is `backoff_s`, then
 `backoff_s * backoff_multiplier` and so on.
+
+The default retry sleeper is `time.sleep`. Tests or applications that need
+deterministic timing can provide a callable `sleeper` to `ResilientLLM`; it is
+called only for positive backoff delays and is also used by
+`ResilientSession`:
+
+```python
+sleeps = []
+llm = ResilientLLM(recovery_plan, sleeper=sleeps.append)
+```
 
 The default retryable errors are:
 
@@ -265,8 +278,11 @@ The breaker moves through three states:
 - `half_open` - one probe request checks whether the route recovered.
 
 A successful probe closes the breaker. A failed probe opens it again. Breaker
-state is shared by all sessions using the same `ResilientLLM` instance. To
-manually reset every configured route breaker:
+state is shared by all sessions using the same `ResilientLLM` instance, and its
+state transitions are protected for concurrent threads in the same process.
+Each route must use its own `CircuitBreaker`; sharing one breaker between two
+routes is rejected during `RecoveryPlan` validation. To manually reset every
+configured route breaker:
 
 ```python
 llm.recovery_plan.reset_breakers()
@@ -350,19 +366,20 @@ llm = ResilientLLM(
 )
 ```
 
-## Limitations in `v0.5.0`
+## Limitations in `v0.6.0`
 
 This version covers synchronous `chat()` calls, application-managed tool
 loops, in-memory circuit breakers, prompt profiles, result policies, and
 capability-aware routing. It does not yet provide async execution, streaming,
-distributed breaker state, thread-safe coordination, automatic provider
-capability discovery, or automatic tool execution. Tool execution remains the
-application's responsibility.
+distributed breaker state, automatic provider capability discovery, or
+automatic tool execution. Tool execution remains the application's
+responsibility.
 
 Circuit state is local to the process that owns the `ResilientLLM` instance.
 If a service runs multiple workers, each worker can make an independent route
-decision. A shared state backend and distributed half-open coordination are
-planned for a future production-hardening version.
+decision. Thread safety does not synchronize breaker state between processes;
+a shared state backend and distributed half-open coordination remain future
+work.
 
 ## E2E tests
 
@@ -377,6 +394,16 @@ pytest -m e2e
 
 Cases without a configured key are skipped. The local `.env` file is ignored
 by Git and must not contain committed credentials.
+
+## Production hardening example
+
+The offline production-hardening example demonstrates strict route setup,
+retry backoff, an injectable sleeper, and breaker metadata without network
+access or API keys:
+
+```bash
+python examples/production_hardening.py
+```
 
 ## Real multi-provider example
 

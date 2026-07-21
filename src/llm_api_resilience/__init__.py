@@ -32,7 +32,7 @@ from .routes import RecoveryPlan, Route
 from .session import ResilientSession, ToolResult
 from .tool_journal import ReplayPolicy, ToolExecutionJournal, ToolExecutionRecord
 
-__version__ = "0.1.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AdapterProtocol",

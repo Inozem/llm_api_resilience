@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 from llm_api_adapter.models.messages.chat_message import AIMessage, ToolMessage
@@ -403,8 +403,7 @@ class ResilientSession:
                     ):
                         break
                     delay_s = route.policy.backoff_for(failed_attempt)
-                    if delay_s > 0:
-                        sleep(delay_s)
+                    self._llm._wait_before_retry(delay_s)
                     continue
 
                 if not response.tool_calls:

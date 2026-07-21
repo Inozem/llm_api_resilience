@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from time import perf_counter, sleep
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .attempts import AttemptRecord
 from .capabilities import (
@@ -37,6 +37,7 @@ class ResilientLLM:
         failure_classifier: Optional[FailureClassifier] = None,
         result_policy: Any = None,
         failover_on_invalid_result: bool = False,
+        sleeper: Optional[Callable[[float], None]] = None,
     ):
         if not isinstance(recovery_plan, RecoveryPlan):
             raise TypeError("recovery_plan must be a RecoveryPlan")
@@ -48,6 +49,8 @@ class ResilientLLM:
             )
         if not isinstance(failover_on_invalid_result, bool):
             raise TypeError("failover_on_invalid_result must be a boolean")
+        if sleeper is not None and not callable(sleeper):
+            raise TypeError("sleeper must be callable or None")
         normalized_result_policy = normalize_result_policy(result_policy)
         if failover_on_invalid_result and normalized_result_policy is None:
             raise ValueError(
@@ -57,6 +60,7 @@ class ResilientLLM:
         self._failure_classifier = failure_classifier
         self._result_policy = normalized_result_policy
         self._failover_on_invalid_result = failover_on_invalid_result
+        self._sleeper = sleeper
         self._last_attempts: Tuple[AttemptRecord, ...] = ()
         self._last_events: Tuple[ObservabilityEvent, ...] = ()
 
@@ -204,8 +208,7 @@ class ResilientLLM:
                         break
 
                     delay_s = route.policy.backoff_for(failed_attempt)
-                    if delay_s > 0:
-                        sleep(delay_s)
+                    self._wait_before_retry(delay_s)
                     continue
 
                 try:
@@ -229,8 +232,7 @@ class ResilientLLM:
                         break
 
                     delay_s = route.policy.backoff_for(failed_attempt)
-                    if delay_s > 0:
-                        sleep(delay_s)
+                    self._wait_before_retry(delay_s)
                     continue
 
                 duration_s = perf_counter() - started_tick
@@ -257,6 +259,16 @@ class ResilientLLM:
         if capability_skips and not eligible_route_seen:
             raise NoCompatibleRouteError(requirements, capability_skips)
         raise RuntimeError("recovery plan did not execute any route")
+
+    def _wait_before_retry(self, delay_s: float) -> None:
+        """Wait between attempts using the configured injectable sleeper."""
+
+        if delay_s <= 0:
+            return
+        if self._sleeper is None:
+            sleep(delay_s)
+            return
+        self._sleeper(delay_s)
 
     @staticmethod
     def _missing_route_capabilities(

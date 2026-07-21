@@ -57,9 +57,24 @@ def test_recovery_plan_rejects_empty_routes():
         RecoveryPlan(routes=[])
 
 
+@pytest.mark.parametrize("routes", [None, "primary", b"primary"])
+def test_recovery_plan_rejects_non_route_collections(routes):
+    with pytest.raises(TypeError, match="iterable of Route objects"):
+        RecoveryPlan(routes=routes)
+
+
 def test_recovery_plan_rejects_duplicate_names():
     with pytest.raises(ValueError, match="unique"):
         RecoveryPlan(routes=[make_route("primary"), make_route("primary")])
+
+
+def test_recovery_plan_rejects_shared_circuit_breaker():
+    breaker = CircuitBreaker(failure_threshold=2)
+    primary = Route(name="primary", adapter=FakeAdapter(), breaker=breaker)
+    backup = Route(name="backup", adapter=FakeAdapter(), breaker=breaker)
+
+    with pytest.raises(ValueError, match="own circuit breaker"):
+        RecoveryPlan(routes=[primary, backup])
 
 
 def test_recovery_plan_preserves_order_and_is_immutable():

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from threading import RLock
 import time
 from typing import Callable, Optional
 
@@ -36,8 +37,9 @@ class CircuitBreaker:
     probe opens it again and starts a new cooldown.
 
     ``clock`` is injectable so the state machine can be tested without
-    sleeping. Thread-safety is intentionally outside this primitive and is
-    planned for the production-hardening version.
+    sleeping. State transitions and snapshots are protected by a re-entrant
+    lock, so one breaker can safely be shared by concurrent threads in a
+    process.
     """
 
     def __init__(
@@ -66,6 +68,7 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.cooldown_s = float(cooldown_s)
         self._clock = clock or time.monotonic
+        self._lock = RLock()
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._opened_at: Optional[float] = None
@@ -75,13 +78,15 @@ class CircuitBreaker:
     def state(self) -> CircuitState:
         """Return the current state without reserving a probe request."""
 
-        return self._state
+        with self._lock:
+            return self._state
 
     @property
     def failure_count(self) -> int:
         """Return the number of consecutive failures in closed state."""
 
-        return self._failure_count
+        with self._lock:
+            return self._failure_count
 
     def allow_request(self) -> bool:
         """Return whether a request may be sent through the circuit.
@@ -92,11 +97,66 @@ class CircuitBreaker:
         or failed.
         """
 
+        with self._lock:
+            return self._allow_request_locked()
+
+    def ensure_request_allowed(self) -> None:
+        """Raise :class:`CircuitOpenError` when the circuit rejects a request."""
+
+        with self._lock:
+            if self._allow_request_locked():
+                return
+            cooldown_remaining_s = self._cooldown_remaining_locked()
+
+        raise CircuitOpenError(cooldown_remaining_s=cooldown_remaining_s)
+
+    def record_failure(self) -> None:
+        """Record a failed request and update the breaker state."""
+
+        with self._lock:
+            if self._state is CircuitState.HALF_OPEN:
+                self._failure_count = self.failure_threshold
+                self._open()
+                return
+
+            if self._state is CircuitState.OPEN:
+                return
+
+            self._failure_count += 1
+            if self._failure_count >= self.failure_threshold:
+                self._open()
+
+    def record_success(self) -> None:
+        """Record a successful request and close/reset the breaker."""
+
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._opened_at = None
+            self._probe_in_flight = False
+
+    def reset(self) -> None:
+        """Manually return the breaker to its initial closed state."""
+
+        self.record_success()
+
+    def snapshot(self) -> CircuitSnapshot:
+        """Return safe state metadata without request or credential data."""
+
+        with self._lock:
+            return CircuitSnapshot(
+                state=self._state,
+                failure_count=self._failure_count,
+                opened_at=self._opened_at,
+                cooldown_remaining_s=self._cooldown_remaining_locked(),
+            )
+
+    def _allow_request_locked(self) -> bool:
         if self._state is CircuitState.CLOSED:
             return True
 
         if self._state is CircuitState.OPEN:
-            if self._cooldown_remaining() > 0:
+            if self._cooldown_remaining_locked() > 0:
                 return False
             self._state = CircuitState.HALF_OPEN
             self._probe_in_flight = False
@@ -109,60 +169,12 @@ class CircuitBreaker:
 
         return False
 
-    def ensure_request_allowed(self) -> None:
-        """Raise :class:`CircuitOpenError` when the circuit rejects a request."""
-
-        if self.allow_request():
-            return
-
-        raise CircuitOpenError(
-            cooldown_remaining_s=self._cooldown_remaining(),
-        )
-
-    def record_failure(self) -> None:
-        """Record a failed request and update the breaker state."""
-
-        if self._state is CircuitState.HALF_OPEN:
-            self._failure_count = self.failure_threshold
-            self._open()
-            return
-
-        if self._state is CircuitState.OPEN:
-            return
-
-        self._failure_count += 1
-        if self._failure_count >= self.failure_threshold:
-            self._open()
-
-    def record_success(self) -> None:
-        """Record a successful request and close/reset the breaker."""
-
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._opened_at = None
-        self._probe_in_flight = False
-
-    def reset(self) -> None:
-        """Manually return the breaker to its initial closed state."""
-
-        self.record_success()
-
-    def snapshot(self) -> CircuitSnapshot:
-        """Return safe state metadata without request or credential data."""
-
-        return CircuitSnapshot(
-            state=self._state,
-            failure_count=self._failure_count,
-            opened_at=self._opened_at,
-            cooldown_remaining_s=self._cooldown_remaining(),
-        )
-
     def _open(self) -> None:
         self._state = CircuitState.OPEN
         self._opened_at = self._now()
         self._probe_in_flight = False
 
-    def _cooldown_remaining(self) -> float:
+    def _cooldown_remaining_locked(self) -> float:
         if self._state is not CircuitState.OPEN or self._opened_at is None:
             return 0.0
 
