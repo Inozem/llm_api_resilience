@@ -13,6 +13,32 @@ result-level validation with opt-in failover, and declarative capability-aware
 routing on top of ordered failover, application-managed tool-calling sessions,
 provider-neutral checkpoints, and cross-provider replay.
 
+## Quick start
+
+Requirements: Python 3.9 or newer.
+
+Install the latest release from PyPI:
+
+```bash
+python -m pip install llm-api-resilience
+```
+
+For local development from the repository:
+
+```bash
+git clone https://github.com/Inozem/llm_api_resilience.git
+cd llm_api_resilience
+python -m pip install -e ".[test]"
+```
+
+Run the offline judge demo:
+
+```bash
+python examples/00_judge_offline_demo.py
+```
+
+The offline demo requires no API keys and no network access.
+
 ## How failover works
 
 Routes are tried in the order defined by `RecoveryPlan`. Each route has its
@@ -395,49 +421,39 @@ pytest -m e2e
 Cases without a configured key are skipped. The local `.env` file is ignored
 by Git and must not contain committed credentials.
 
-## Production hardening example
+## Offline examples
 
-The offline production-hardening example demonstrates strict route setup,
-retry backoff, an injectable sleeper, and breaker metadata without network
-access or API keys:
-
-```bash
-python examples/production_hardening.py
-```
-
-## Real multi-provider example
-
-The repository also includes an offline circuit-breaker example that requires
-no API keys or network access:
+The judge demo runs a deterministic failover scenario without API keys or
+network access:
 
 ```bash
-python examples/circuit_breaker_observability.py
+python examples/00_judge_offline_demo.py
 ```
 
-It demonstrates an initial failover, skipping an open primary route, and a
-successful half-open recovery probe.
-
-The result-level failover demo is also fully offline:
+The basic safe-route demo shows a failed primary route and a successful backup
+route:
 
 ```bash
-python examples/invalid_result_failover.py
+python examples/02_safe_route_demo.py
 ```
 
-It uses two valid JSON responses with different business-quality metadata.
-The primary response has low confidence, so `ResultPolicy` rejects it and the
-backup route is selected. No API keys or network access are required.
-
-The repository includes a runnable example using real
-`UniversalLLMAPIAdapter` instances for OpenAI, Anthropic, and Google:
+The tool-session demo shows checkpoint recovery, journal replay, and protection
+against duplicate side effects:
 
 ```bash
-python -m pip install -e ".[test]"
-python examples/multi_provider_tool_failover.py
+python examples/03_tool_session_failover_demo.py
 ```
 
-Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` in `.env`
-before running it. The example executes a tool once and demonstrates how the
-session continues and replays the result when a later route is required.
+## Live API example
+
+The live OpenAI example is optional and requires an `OPENAI_API_KEY`:
+
+```bash
+python examples/01_openai_api_safe_route.py
+```
+
+The offline examples are sufficient to verify the core failover and recovery
+functionality.
 
 ## License
 
