@@ -462,16 +462,6 @@ provider failures. They generate their own scenario data, so no external
 dataset, API key, or network access is required to test the core failover and
 recovery behavior.
 
-## AI-assisted development
-
-Codex and GPT-5.6 were used throughout development to inspect the architecture,
-implement planned changes, generate failure-path tests, and review whether the
-code matched the intended design.
-
-Notion was used as an external planning and reasoning layer. Implementation
-plans and detailed commit plans were prepared there, and only the relevant
-project context was provided to Codex for each task. Claude Code was also used
-as a comparison point when evaluating AI-assisted development workflows.
 
 ## License
 
